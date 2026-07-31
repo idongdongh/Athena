@@ -1,0 +1,213 @@
+import signal
+from anthropic import Anthropic
+from anthropic.types import TextBlock, ToolUseBlock
+from dotenv import load_dotenv
+import os
+
+from tools.registry import registry, discover
+from agent.tool_executor import run_tool_calls
+from agent.tracer import reset_tracer, get_tracer
+
+load_dotenv(override=True)
+
+# 启动期校验：key/model 缺失时抛友好 RuntimeError，而不是让 SDK 拿到 None 后抛栈
+# 兼容两套命名（API_KEY / ANTHROPIC_API_KEY），与 web_extract_tool.py 保持一致
+_api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("API_KEY")
+if not _api_key:
+    raise RuntimeError(
+        "ANTHROPIC_API_KEY（或 API_KEY）未设置。请在项目根 .env 配置后重试。"
+    )
+_model_id = os.getenv("MODEL_ID")
+if not _model_id:
+    raise RuntimeError(
+        "MODEL_ID 未设置。请在项目根 .env 配置后重试。"
+    )
+
+client = Anthropic(base_url=os.getenv("BASE_URL"), api_key=_api_key)
+MODEL_ID = _model_id
+
+
+def _build_system() -> str:
+    """组装 system prompt。
+
+    会话级只建一次（模块 import 时求值，整个会话复用）。后续向 hermes 对齐时，
+    在这里追加拼接 skills / tools / memory 等片段——hermes 的 system prompt 就是
+    多段动态拼装的，本函数即对应该拼装入口的简化版。
+    """
+    workdir = os.getcwd()
+    return (
+        f"You are a coding agent at {workdir}. Use tools to solve tasks. Act, don't explain."
+        "如果执行工具的过程用户拒绝了你的工具请求，你不应该绕过命令，而是向用户说明原因"
+    )
+
+
+# 会话级快照：import 时建一次，主循环与收尾总结共用，保证整个会话 system prompt 稳定
+SYSTEM = _build_system()
+# 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾（对齐 hermes max_iterations 默认 90）
+MAX_ITERATIONS = 90
+# API 调用超时（秒）：防止网络层面无限期阻塞
+API_TIMEOUT = 300.0
+# 工具并发执行：True 时一个 turn 的多个独立工具调用并行派发（ThreadPoolExecutor）。
+# 单调用自动走顺序路径；仅当本轮 >1 个 tool_use 才启线程。对齐 hermes execute_tool_calls_concurrent。
+CONCURRENT_TOOLS = True
+# 并发线程池上限
+TOOL_MAX_WORKERS = 4
+# 单轮 API 输出 token 上限：tool_use 块本就小，1024 够；summary 轮要产长文本，
+# 默认 4096（对齐 hermes handle_max_iterations 的 `or 4096` 兜底语义），
+# 允许 .env 覆盖（MAX_TOKENS_SUMMARY=8192）。
+MAX_TOKENS_TOOL = 1024
+MAX_TOKENS_SUMMARY = int(os.getenv("MAX_TOKENS_SUMMARY", "4096"))
+
+# ---- 用户中断机制（对齐 hermes _interrupt_requested） ----
+# Python 规则：任何函数内对模块级变量执行赋值（=），必须在函数内声明 global。
+_interrupt_requested = False
+
+
+# signum：信号编号，不同编号对应不同的中断机制
+# frame：栈帧，当前程序执行的快照
+def _on_interrupt(signum, frame):
+    """第一次 Ctrl+C 设置中断标志；第二次 Ctrl+C 恢复默认行为，直接终止进程。"""
+    # 只要函数体内对全局变量执行了赋值操作（=），就必须在函数内声明 global
+    global _interrupt_requested
+    _interrupt_requested = True
+    print(
+        "\n\033[33m⚠️  Interrupt requested — finishing after current API call..."
+        " (Ctrl+C again to force quit)\033[0m"
+    )
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+# 触发所有工具文件自注册：默认扫描 tools/ 下含 registry.register(...) 的模块并 import，
+discover()
+
+
+def _last_user_text(messages):
+    """提取最近一条 user 消息的纯文本，用于 trace 记录 query。"""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return "".join(b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text")
+    return None
+
+
+def _assistant_text(res):
+    """提取模型本轮回复里的文本块，用于 trace 记录。"""
+    return "".join(getattr(b, "text", "") for b in res.content
+                   if getattr(b, "type", None) == "text")
+
+
+def agent_loop(messages):
+    global _interrupt_requested
+    _interrupt_requested = False
+
+    # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
+    tr = reset_tracer()
+
+    # 设置 SIGINT 信号的处理函数
+    signal.signal(signal.SIGINT, _on_interrupt)
+
+    # 提前初始化：确保 except KeyboardInterrupt 分支里的引用一定绑过
+    # （Pylance reportPossiblyUnboundVariable；运行时若 while 一次不进 + 立即
+    # Ctrl+C，api_call_count 会 UnboundLocalError）
+    api_call_count = 0
+
+    try:
+        while api_call_count < MAX_ITERATIONS and not _interrupt_requested:
+            api_call_count += 1
+            tr.step_start(api_call_count, len(messages), True, query=_last_user_text(messages))
+            res = client.messages.create(
+                model=MODEL_ID,
+                messages=messages,
+                system=SYSTEM,
+                max_tokens=MAX_TOKENS_TOOL,
+                tools=registry.definitions(),
+                timeout=API_TIMEOUT,
+            )
+
+            messages.append({"role": "assistant", "content": res.content})
+            tr.step_done(
+                res.stop_reason,
+                # 模型要调用的所有工具名称
+                [b.name for b in res.content if isinstance(b, ToolUseBlock)],
+                # 模型回复的 text（str）
+                assistant_text=_assistant_text(res),
+            )
+
+            if _interrupt_requested or res.stop_reason != "tool_use":
+                break
+
+            # 把本轮 tool_use 块交给执行引擎调度，结果回写 messages
+            run_tool_calls(res.content, messages, concurrent=CONCURRENT_TOOLS, max_workers=TOOL_MAX_WORKERS)
+
+        # 达到步数上限或收到中断信号：去掉 tools 做一次总结调用，优雅收尾
+        # 如果因中断跳出且最后的 assistant 消息含未处理的 tool_use，需先移除；
+        # 否则 API 会因 "tool_use 缺少对应 tool_result" 拒绝请求（BadRequestError 400）。
+        if _interrupt_requested and messages[-1]["role"] == "assistant":
+            if any(block.type == "tool_use" for block in messages[-1]["content"]):
+                messages.pop()
+        if _interrupt_requested:
+            label = f"interrupted at {api_call_count}/{MAX_ITERATIONS}"
+        else:
+            label = f"iteration budget exhausted ({api_call_count}/{MAX_ITERATIONS})"
+        print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
+        res = client.messages.create(
+            model=MODEL_ID,  # type: ignore
+            messages=messages,
+            system=SYSTEM,
+            max_tokens=MAX_TOKENS_SUMMARY,
+            timeout=API_TIMEOUT,
+        )
+        messages.append({"role": "assistant", "content": res.content})
+        tr.finish(label, api_call_count)
+
+    except KeyboardInterrupt:
+        get_tracer().finish("force_quit", api_call_count)
+        # 第二次 Ctrl+C（_on_interrupt 已把 SIGINT 复位为 SIG_DFL）：强制中断，不崩 REPL
+        print("\n\033[33m⚠️  Force quit — 已中断当前任务，返回输入提示。\033[0m")
+        # 修复消息历史，避免下轮 API 因「角色不交替」或「tool_use 缺 tool_result」而 400
+        if messages:
+            last = messages[-1]
+            # 丢掉未完成的 assistant(tool_use)（没有对应 tool_result）
+            if last.get("role") == "assistant" and any(
+                getattr(b, "type", None) == "tool_use" for b in last.get("content", [])
+            ):
+                messages.pop()
+            # 若仍以 user 结尾，补一条 assistant 占位，保证下轮 user/assistant 交替
+            if messages and messages[-1].get("role") == "user":
+                messages.append({
+                    "role": "assistant",
+                    "content": [TextBlock(type="text", text="[任务被用户中断]")],
+                })
+    finally:
+        # 恢复默认 SIGINT 行为，确保外层 REPL 的 input() 正常响应 Ctrl+C
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        _interrupt_requested = False
+
+
+if __name__ == "__main__":
+    print("输入问题，回车发送。输入'q'、'exit'、''退出。")
+    # 历史消息列表
+    history = []
+    # 持续接收用户输入
+    while True:
+        # 接收用户输入，并检查是否退出
+        try:
+            query = input("\033[33m >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            print("\n收到终止信号，退出交互")
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+
+        # 将用户 query 追加到历史消息列表中
+        history.append({"role": "user", "content": query})
+
+        agent_loop(history)
+
+        for block in history[-1]["content"]:
+            if block.type == "text":
+                print(block.text)
