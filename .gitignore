@@ -31,14 +31,14 @@ logs/
 # ════════════════════════════════════════════════════════════════════
 # 用户自有产物 —— 不进公开 repo（交接文档 §五"不动用户自有"铁律）
 # ════════════════════════════════════════════════════════════════════
-# rag.py 含个人桌面路径；test.py 是临时调试；notebook 下的实验产物是个人笔记
+# rag.py 含个人桌面路径；test.py 是临时调试
 rag.py
 test.py
-notebook/当前问题.md
-notebook/anthropic_res_json/
-notebook/test_result_json/
-notebook/glob_tool_ast.txt
 AGENT_HANDOFF.md
+
+# notebook/ —— 整体不入库（演进日志 + 异同点对照是个人学习产物，
+# 含安全实现细节，公开会暴露权限闸门防御机制）
+notebook/
 
 # .DS_Store（macOS 系统文件）
 .DS_Store
