@@ -1,12 +1,10 @@
-"""web_search_tool.py — 借鉴 hermes 搜索工具的思路，但极简化：
-一个普通函数 + 一份工具描述，直接交给 LLM 用，无注册表、无 provider 抽象。
+"""Tavily 网络搜索工具。
 
 hermes 思路只保留一条：把搜索结果归一化成干净的
 {title, url, description, position} 结构，再返回 JSON 字符串给模型，
 而不是把 vendor 原始 dict 直接丢出去。
 
-后端默认用你项目里已有的 Tavily（无需新装依赖）；想换成免费无 key 的 DDGS，
-看文件底部注释，改两行即可。
+当前项目不保留 Hermes 的多 provider 抽象，工具通过本地 registry 自注册。
 """
 
 import os
@@ -25,7 +23,7 @@ def web_search(query: str, limit: int = 5) -> str:
     """
     使用可用的搜索 API 后端搜索网络信息。
 
-    该函数提供一个通用的网络搜索接口，可兼容多个后端（Parallel 或 Firecrawl）。
+    当前后端固定为 Tavily。
 
     注意：此函数仅返回搜索结果的元数据（URL、标题、描述）。
     如需获取特定 URL 的完整内容，请使用 web_extract_tool。
@@ -51,8 +49,7 @@ def web_search(query: str, limit: int = 5) -> str:
                  }
              }
 
-    Raises:
-        Exception: 如果搜索失败或未设置 API 密钥
+    失败时返回 ``{"success": false, "error": ...}``，不向调用方抛异常。
     """
     try:
         limit = int(limit)
@@ -106,22 +103,6 @@ WEB_SEARCH_TOOL = {
 
 if registry is not None:
     registry.register(name="web_search", schema=WEB_SEARCH_TOOL, handler=web_search)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 想换成免费、无需 API key 的 DDGS 后端？把顶部 import 和 web_search 改成：
-#
-#     from ddgs import DDGS
-#     def web_search(query: str, limit: int = 5) -> str:
-#         raw = DDGS().text(query, max_results=min(max(int(limit), 1), 20))
-#         web = [{"title": i.get("title",""), "url": i.get("href",""),
-#                 "description": i.get("body",""), "position": n}
-#                for n, i in enumerate(raw or [], start=1)]
-#         return json.dumps({"success": True, "data": {"web": web}},
-#                           ensure_ascii=False, indent=2)
-#
-# 然后 `pip install ddgs` 即可，无需任何 API key。
-# ──────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))

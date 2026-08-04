@@ -13,7 +13,6 @@
 """
 
 import json
-from pathlib import Path
 
 try:
     from tools.registry import registry
@@ -67,11 +66,12 @@ def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
     if offset == 1 and text.startswith("\ufeff"):
         text = text.lstrip("\ufeff")
 
-    lines = text.split("\n")
+    lines = text.splitlines()
     total_lines = len(lines)
     end_line = offset + limit - 1
-    page = "\n".join(lines[offset - 1:end_line])
-    content = _add_line_numbers(page, offset)
+    page_lines = lines[offset - 1:end_line]
+    page = "\n".join(page_lines)
+    content = _add_line_numbers(page, offset) if page_lines else ""
 
     # 字符上限：超限拒绝，提示用 offset/limit 缩小范围
     if len(content) > MAX_READ_CHARS:

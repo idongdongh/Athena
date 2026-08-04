@@ -3,9 +3,9 @@
 与 web_search 分离（hermes 也是两个独立工具）：
 - web_search 只回元数据（标题/链接/摘要），永不返回正文，所以不会撑爆 token；
 - web_extract 才真正抓取页面正文，并按长度分级控制（与 hermes 一致）：
-    * < 5000 字符：原样返回
-    * 5000 – 500k：单遍 LLM 摘要压到 5000（保留关键信息，避免截断丢尾部）
-    * 500k – 2M：切成 100k/块，逐块摘要后合成，再压到 5000
+    * < 5000 字符：在调用方要求的 max_chars 内原样返回
+    * 5000 – 500k：单遍 LLM 摘要压到 max_chars（最大 5000）
+    * 500k – 2M：切成 100k/块，逐块摘要后合成，再压到 max_chars
     * > 2M：拒绝，提示换更聚焦的 URL
 - 摘要失败 → 自动回退到截断（永不报错给 LLM），与 hermes 失败降级一致；
 - 清掉内嵌 base64 图片（最烧 token 的噪声），与 hermes 一致。
@@ -33,10 +33,11 @@ load_dotenv(os.path.join(_here, "..", ".env"), override=True)
 
 
 # 分级阈值（与 hermes process_content_with_llm 完全一致，单位：字符）
-MIN_SUMMARY_CHARS = 5_000      # 小于此值原样返回
+MIN_SUMMARY_CHARS = 5_000      # 小于此值不调用摘要模型，仍受 max_chars 限制
 CHUNK_THRESHOLD = 500_000      # 大于此值走分块摘要
 CHUNK_SIZE = 100_000           # 分块大小
 MAX_OUTPUT_CHARS = 5_000       # 单页输出硬上限
+MAX_SUMMARY_TOKENS = 8_192     # 摘要模型单次输出 token 上限
 REFUSE_CHARS = 2_000_000       # 超过约 2MB 直接拒绝
 MAX_URLS = 5                   # 单次最多抽取 URL 数（对应 hermes 的 maxItems=5）
 
@@ -49,13 +50,16 @@ def _strip_base64_images(text: str) -> str:
 
 
 def _trim(text: str, max_chars: int) -> str:
-    """失败降级用的截断函数（hermes 也保留这个 fallback）。"""
+    """把正文和截断提示一起限制在 max_chars 内。"""
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + (
+    suffix = (
         f"\n\n[... 内容已截断：仅显示前 {max_chars:,} / 共 {len(text):,} 字符。"
         "如需更多，请换更聚焦的 URL 或用 web_search 获取摘要 ...]"
     )
+    if len(suffix) >= max_chars:
+        return text[:max_chars]
+    return text[:max_chars - len(suffix)] + suffix
 
 
 _summary_client = None  # lazy singleton：长文分块时复用同一客户端，避免每块新建连接
@@ -92,7 +96,9 @@ def _summarize_chunk(text: str, max_chars: int) -> str:
         raise RuntimeError("MODEL_ID 未设置，无法调用摘要模型")
     resp = client.messages.create(
         model=model,
-        max_tokens=max_chars * 2,  # 给足余量，最后再按 max_chars 切
+        # max_chars 是字符预算，不可直接当 token 数。Hermes 的摘要调用使用固定上限；
+        # 这里按请求大小缩放，但始终限制在模型可接受的单次输出范围内。
+        max_tokens=min(MAX_SUMMARY_TOKENS, max(256, max_chars)),
         messages=[{
             "role": "user",
             "content": (
@@ -125,7 +131,7 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
 
     Args:
         urls: 一个 URL 字符串，或 URL 列表（最多 5 个）
-        max_chars: 每个页面返回的正文上限，默认 5000
+        max_chars: 每个页面返回的正文上限，范围 1-5000
     """
     if isinstance(urls, str):
         urls = [urls]
@@ -137,7 +143,7 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
         max_chars = int(max_chars)
     except (TypeError, ValueError):
         max_chars = MAX_OUTPUT_CHARS
-    max_chars = min(max(max_chars, 1), REFUSE_CHARS)
+    max_chars = min(max(max_chars, 1), MAX_OUTPUT_CHARS)
 
     try:
         client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
@@ -154,9 +160,10 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
         content = item.get("raw_content", "") or item.get("content", "")
 
         if len(content) > REFUSE_CHARS:
+            refused = f"[页面过大（>{REFUSE_CHARS // 1_000_000}MB），已拒绝；请换更聚焦的来源]"
             results.append({
                 "url": url,
-                "content": f"[页面过大（>{REFUSE_CHARS // 1_000_000}MB），已拒绝；请换更聚焦的来源]",
+                "content": _trim(refused, max_chars),
                 "truncated": True,
             })
             continue
@@ -169,9 +176,9 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
         #   500k – 2M    分块摘要后合成
         # 摘要失败 → 降级到 _trim，绝不把异常抛给模型。
         if len(content) <= MIN_SUMMARY_CHARS:
-            final = content
+            final = _trim(content, max_chars)
             was_summarized = False
-            is_truncated = False
+            is_truncated = len(content) > max_chars
         else:
             try:
                 final = _summarize_long_text(content, max_chars)
@@ -235,7 +242,9 @@ WEB_EXTRACT_TOOL = {
             },
             "max_chars": {
                 "type": "integer",
-                "description": "每个页面返回的正文上限字符数，默认 5000（可选）",
+                "description": "每个页面返回的正文上限字符数，默认及最大 5000（可选）",
+                "minimum": 1,
+                "maximum": 5000,
             },
         },
         "required": ["urls"],

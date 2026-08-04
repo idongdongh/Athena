@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import os
 
 from tools.registry import registry, discover
-from agent.tool_executor import run_tool_calls
+from agent.tool_executor import run_tool_calls, tool_guardrails
 from agent.tracer import reset_tracer, get_tracer
 
 load_dotenv(override=True)
@@ -30,9 +30,8 @@ MODEL_ID = _model_id
 def _build_system() -> str:
     """组装 system prompt。
 
-    会话级只建一次（模块 import 时求值，整个会话复用）。后续向 hermes 对齐时，
-    在这里追加拼接 skills / tools / memory 等片段——hermes 的 system prompt 就是
-    多段动态拼装的，本函数即对应该拼装入口的简化版。
+    会话级只建一次（模块 import 时求值，整个会话复用）。当前精简版
+    只注入工作目录和基本工具策略，不动态拼接 Hermes 的 skills / memory 片段。
     """
     workdir = os.getcwd()
     return (
@@ -47,8 +46,8 @@ SYSTEM = _build_system()
 MAX_ITERATIONS = 90
 # API 调用超时（秒）：防止网络层面无限期阻塞
 API_TIMEOUT = 300.0
-# 工具并发执行：True 时一个 turn 的多个独立工具调用并行派发（ThreadPoolExecutor）。
-# 单调用自动走顺序路径；仅当本轮 >1 个 tool_use 才启线程。对齐 hermes execute_tool_calls_concurrent。
+# 工具并发执行：仅工具名互不重复的只读调用会并行；bash、写操作和重复调用顺序执行。
+# Hermes 通过审批回调和跨线程状态传播支持更宽的并发，本项目保留安全子集。
 CONCURRENT_TOOLS = True
 # 并发线程池上限
 TOOL_MAX_WORKERS = 4
@@ -104,6 +103,9 @@ def agent_loop(messages):
     global _interrupt_requested
     _interrupt_requested = False
 
+    # 每条用户请求开始时，重置重复调用计数和 halt 锁存。
+    tool_guardrails.reset_for_turn()
+
     # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
     tr = reset_tracer()
 
@@ -114,6 +116,7 @@ def agent_loop(messages):
     # （Pylance reportPossiblyUnboundVariable；运行时若 while 一次不进 + 立即
     # Ctrl+C，api_call_count 会 UnboundLocalError）
     api_call_count = 0
+    exit_reason = None
 
     try:
         while api_call_count < MAX_ITERATIONS and not _interrupt_requested:
@@ -137,18 +140,36 @@ def agent_loop(messages):
                 assistant_text=_assistant_text(res),
             )
 
-            if _interrupt_requested or res.stop_reason != "tool_use":
+            if res.stop_reason != "tool_use":
+                exit_reason = "completed"
+                break
+            if _interrupt_requested:
+                # 当前 assistant 只包含尚未执行的 tool_use，必须移除后才能总结。
+                messages.pop()
+                exit_reason = "interrupted"
                 break
 
             # 把本轮 tool_use 块交给执行引擎调度，结果回写 messages
             run_tool_calls(res.content, messages, concurrent=CONCURRENT_TOOLS, max_workers=TOOL_MAX_WORKERS)
 
-        # 达到步数上限或收到中断信号：去掉 tools 做一次总结调用，优雅收尾
-        # 如果因中断跳出且最后的 assistant 消息含未处理的 tool_use，需先移除；
-        # 否则 API 会因 "tool_use 缺少对应 tool_result" 拒绝请求（BadRequestError 400）。
-        if _interrupt_requested and messages[-1]["role"] == "assistant":
-            if any(block.type == "tool_use" for block in messages[-1]["content"]):
-                messages.pop()
+            # 与 Hermes 一致：guardrail halt 是一个明确的受控结束，不再额外调用模型总结。
+            halt_decision = tool_guardrails.halt_decision
+            if halt_decision is not None:
+                halt_text = f"工具调用已停止：{halt_decision.message}"
+                print(f"\n\033[33m⚠️  {halt_text}\033[0m")
+                messages.append({
+                    "role": "assistant",
+                    "content": [TextBlock(type="text", text=halt_text)],
+                })
+                exit_reason = "guardrail_halt"
+                break
+
+        # 正常完成和 guardrail 受控结束都已有最终 assistant 消息，直接返回。
+        if exit_reason in {"completed", "guardrail_halt"}:
+            tr.finish(exit_reason, api_call_count)
+            return
+
+        # 只有迭代预算耗尽或中断在未完成工具轮时，才去掉 tools 请求一次收尾总结。
         if _interrupt_requested:
             label = f"interrupted at {api_call_count}/{MAX_ITERATIONS}"
         else:

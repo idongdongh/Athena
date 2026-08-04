@@ -1,13 +1,13 @@
 """工具执行引擎（不在 tools/ 内，避免被 discover() 扫描误当作工具加载）。
 
 两层职责（对齐 hermes，但合进一个文件——本工程只有 loop 一个调用面）：
-- dispatch_tool_call(name, args)：派发「单个」工具调用，对应 hermes handle_function_call 核心。
-- run_tool_calls(blocks, messages, ...)：编排「一个 turn 模型返回的一批」tool_use 块，
+- dispatch_tool_call(name, args)：执行单个工具调用，对应 hermes handle_function_call 核心。
+- run_tool_calls(blocks, messages, ...)：执行模型这一轮返回的一批 tool_use 调用，
   对应 hermes execute_tool_calls_sequential / _concurrent 核心。
 
 保留的核心能力（区别于「别复杂」砍掉的厚壳）：
 - 失败隔离（handler 异常不崩 loop）
-- 并发执行（concurrent=True：ThreadPoolExecutor 并行派发多个独立工具调用）
+- 安全并发（只并发工具名互不重复的只读调用）
 - 单轮预算（TURN_BUDGET_CHARS：限制本轮工具结果总大小，溢出截断，防上下文被撑爆）
 
 砍掉的厚壳：中间件、pre/post hook、显示 spinner、tool_search 桥接、ACP 编辑审批、
@@ -17,6 +17,13 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, List
 
+from agent.tool_guardrails import (
+    IDEMPOTENT_TOOL_NAMES,
+    ToolCallGuardrailController,
+    append_guardrail_guidance,
+    is_tool_failure,
+    toolguard_synthetic_result,
+)
 from tools._permission import check_tool_permission
 from tools.registry import registry
 from agent.tracer import get_tracer
@@ -24,6 +31,11 @@ from agent.tracer import get_tracer
 # 单轮工具结果总字符上限（对应 hermes enforce_turn_budget）。
 # hermes 按上下文窗口动态缩放；本工程用固定值（约 75K token），可按需调大。
 TURN_BUDGET_CHARS = 300_000
+
+# 工具调用重复检测控制器（per-turn 状态机）。
+# 模块级单例 —— 本项目单 loop 单进程，对应 hermes ``agent._tool_guardrails``。
+# ``conversation_loop.agent_loop`` 在每个 turn 开头调用 ``reset_for_turn``。
+tool_guardrails = ToolCallGuardrailController()
 
 
 def dispatch_tool_call(name: str, args: dict) -> str:
@@ -43,19 +55,38 @@ def dispatch_tool_call(name: str, args: dict) -> str:
     entry = registry.get_entry(name)
     if entry is None:
         return f"Unknown tool: {name}"
+    # 重复检测 before_call：判精确失败重复 / 只读无进展是否达 block 阈值。
+    # 放在权限闸门之前——更便宜/无 IO 的检查先做。
+    guardrail_decision = tool_guardrails.before_call(name, args)
+    if not guardrail_decision.allows_execution:
+        # block：返回合成 result（不执行 handler），同时 _halt_decision 已在控制器内 latch
+        synthetic = toolguard_synthetic_result(guardrail_decision)
+        get_tracer().tool_result(name, synthetic)
+        print(f"\033[33m⚠️  guardrail block: {guardrail_decision.message}\033[0m")
+        return synthetic
     # 权限闸门：被拦（返回非 None）则不执行 handler，直接把拒绝消息作为结果返回给模型。
-    # 被 OS 5 系统调用级别的 pre-call hook，统一接缝在 tools/_permission.py。
+    # 命令和路径权限检查统一接在 tools/_permission.py。
     gated = check_tool_permission(name, args)
     if gated is not None:
         # 记录未放行原因
         get_tracer().tool_result(name, gated)
+        # 权限拒绝也算是「失败」——计入控制器，让连续被拒的调用能被重复检测到
+        post_decision = tool_guardrails.after_call(name, args, gated, failed=True)
+        if post_decision.action in {"warn", "halt"}:
+            gated = append_guardrail_guidance(gated, post_decision)
         return gated
     try:
         output = entry.handler(**args)
     except Exception as e:
-        return f"Error: {e}"
-    get_tracer().tool_result(name, str(output))
-    return str(output)
+        output = f"Error: {e}"
+    # 重复检测 after_call：分类失败 + 更新计数 + 可能追加引导/halt
+    output_str = str(output)
+    is_error = is_tool_failure(name, output_str)
+    post_decision = tool_guardrails.after_call(name, args, output_str, failed=is_error)
+    if post_decision.action in {"warn", "halt"}:
+        output_str = append_guardrail_guidance(output_str, post_decision)
+    get_tracer().tool_result(name, output_str)
+    return output_str
 
 
 def _enforce_turn_budget(results: List[dict]) -> None:
@@ -65,21 +96,17 @@ def _enforce_turn_budget(results: List[dict]) -> None:
     防止失控循环产出大量大结果把上下文撑爆。原地修改 results 中超标的 content。
     """
     total = 0
+    marker = "\n... [工具结果已按单轮预算截断]"
     for r in results:
-        size = len(r["content"])
-        if total + size > TURN_BUDGET_CHARS:
-            remaining = max(0, TURN_BUDGET_CHARS - total)
-            if remaining == 0:
-                r["content"] = (
-                    f"[工具结果已被截断：单轮预算 {TURN_BUDGET_CHARS} 字符已用尽]"
-                )
+        content = str(r.get("content", ""))
+        remaining = max(0, TURN_BUDGET_CHARS - total)
+        if len(content) > remaining:
+            if remaining <= len(marker):
+                content = marker[:remaining]
             else:
-                r["content"] = (
-                    r["content"][:remaining]
-                    + f"\n... [已按单轮预算截断至 {remaining} 字符]"
-                )
-            size = len(r["content"])
-        total += size
+                content = content[:remaining - len(marker)] + marker
+            r["content"] = content
+        total += len(content)
 
 
 def run_tool_calls(
@@ -88,12 +115,14 @@ def run_tool_calls(
     concurrent: bool = False,
     max_workers: int = 4,
 ) -> None:
-    """编排一个 turn 模型返回的一批 tool_use 块，结果回写 messages。
+    """执行模型这一轮返回的一批 tool_use 调用，把工具结果统一回写 messages。
 
-    对应 hermes execute_tool_calls_sequential（concurrent=False）/
-    execute_tool_calls_concurrent（concurrent=True）的核心：
-    遍历模型本轮返回的 content，挑出 tool_use 块派发（顺序或并发），
-    收集 tool_result，经单轮预算校验后作为一条 user 消息 append 回对话。
+    具体做 4 件事：
+    1. 从 blocks 中挑出 tool_use 块（跳过 text 块）
+    2. 并发或顺序执行 dispatch_tool_call（并发时保证结果按原顺序回填）
+    3. 单轮工具结果总和超 30 万字符则截断（防撑爆上下文窗口）
+    4. 把所有 tool_result 打包成一条 user 消息 append 到 messages
+       （API 要求：一轮 assistant 的多个 tool_use 必须用一条 user 消息回复）
 
     Args:
         blocks: assistant 消息的 content 列表（含 text / tool_use 块）。
@@ -110,8 +139,17 @@ def run_tool_calls(
     for b in calls:
         print(f"use_tool:\033[33m{b.name}\033[0m\n")
 
-    # 检查权限并执行工具
-    if concurrent and len(calls) > 1:
+    # 当前 CLI 没有 Hermes 的跨线程审批回调和完整状态传播。
+    # 只并发执行「工具名互不重复的只读调用」；bash、写工具和重复调用保持顺序，
+    # 避免多个线程争抢 input()，也保证重复计数在下一次调用前已经落地。
+    names = [b.name for b in calls]
+    parallel_safe = (
+        concurrent
+        and len(calls) > 1
+        and len(names) == len(set(names))
+        and all(name in IDEMPOTENT_TOOL_NAMES for name in names)
+    )
+    if parallel_safe:
         # 结果是：[None, None]
         outs: List[Any] = [None] * len(calls)
         ex = ThreadPoolExecutor(max_workers=min(max_workers, len(calls)))

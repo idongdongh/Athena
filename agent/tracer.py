@@ -18,6 +18,7 @@ import time
 import json
 import os
 import threading
+import uuid
 from datetime import datetime
 
 TRACE_DIR = "logs"
@@ -32,7 +33,8 @@ def _truncate(s: str, n: int = 500) -> str:
 class Tracer:
     def __init__(self, path=None):
         os.makedirs(TRACE_DIR, exist_ok=True)
-        self.path = path or os.path.join(TRACE_DIR, f"trace_{datetime.now():%Y%m%d_%H%M%S}.jsonl")
+        trace_id = f"{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid.uuid4().hex[:8]}"
+        self.path = path or os.path.join(TRACE_DIR, f"trace_{trace_id}.jsonl")
         self.t0 = time.time()
         self.steps = 0
 

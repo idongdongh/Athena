@@ -1,98 +1,42 @@
-"""file 工具的路径安全（写操作闸门）。
+"""write_file / patch 的敏感路径拒绝规则。
 
-对齐 hermes 两处源的子集：
-- ``tools/path_security.py`` 的 ``validate_within_dir`` / ``has_traversal_component``
-  （workspace 边界 + ``..`` 快速检测，逐行搬）。
-- ``tools/file_tools.py:416-470`` 的敏感路径黑名单（``_SENSITIVE_PATH_PREFIXES`` 等），
-  + ``tools/approval.py:206-219`` 的敏感写入目标（ssh/env/config/credentials）。
+对齐 Hermes ``agent/file_safety.py:is_write_denied`` 的两个关键行为：先解析
+realpath（覆盖相对路径和符号链接），再按精确路径、目录前缀和 basename 判断。
 
-砍掉的 hermes 厚壳：
-- ``_resolve_path_for_task``（task_id 多工作目录）→ 复用本项目已有的 ``tools/_path.resolve``
-  （单 cwd 场景）。
-- symlink hop 遍历（20 跳）→ V1 单次 ``Path.resolve()`` 够用。
-- V4A patch header ``..`` 检测 → 本项目 patch 工具无 V4A 模式。
-- ``_get_hermes_config_resolved`` → 用等价的 ``~/.env`` 保护替代。
-
-本模块只负责「写操作」（write_file / patch）。读操作（read_file / search_files）V1 放行，
-hermes 那边的设备文件拦截（/dev/zero、/proc/*/environ）属厚壳，按「别复杂」暂不做。
+这是一层面向模型的 defense-in-depth，不是 OS 沙箱：bash 与当前进程拥有相同的
+文件权限。若需要真正隔离，应把工具放进受限执行环境，而不是继续扩充路径黑名单。
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
 from tools._path import resolve
 
 
-def validate_within_dir(path: Path, root: Path) -> Optional[str]:
-    """确保 *path* 解析后落在 *root* 之内。
-
-    返回错误消息字符串（校验失败）或 ``None``（安全）。
-    用 ``Path.resolve()`` 跟符号链接 + 归一化 ``..`` 分量。
-
-    用法::
-
-        error = validate_within_dir(user_path, allowed_root)
-        if error:
-            return json.dumps({"error": error})
-    """
-    try:
-        resolved = path.resolve()
-        root_resolved = root.resolve()
-        resolved.relative_to(root_resolved)
-    except (ValueError, OSError) as exc:
-        return f"Path escapes allowed directory: {exc}"
-    return None
-
-
-def has_traversal_component(path_str: str) -> bool:
-    """若 *path_str* 含 ``..`` 路径分量则返回 True。
-
-    在做完整 resolve 之前的快速词法预检（无 IO）。
-    """
-    parts = Path(path_str).parts
-    return ".." in parts
-
-
-# ── 系统敏感路径（来源：hermes file_tools.py:416-420）─────────────────────
-# 写入这些路径前缀/精确路径一律拒绝。realpath 后匹配，防符号链接绕过。
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",   # macOS 符号链接镜像
+    "/private/etc/", "/private/var/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
-# ── 用户/项目敏感写入目标（来源：hermes approval.py:206-219 简化）─────────
-# ssh 密钥、shell rc、凭据文件、项目 .env/config —— 写入这些可植入后门/窃取凭据。
-# expanduser + normpath 后做前缀/精确匹配。
 _SENSITIVE_USER_WRITES = (
-    "~/.ssh/",            # authorized_keys 植入、私钥窃取
-    "~/.env",             # 本项目根 .env（API key 明文）
-    "~/.bashrc", "~/.zshrc", "~/.profile", "~/.bash_profile", "~/.zprofile",  # 登录时执行命令注入
-    "~/.netrc", "~/.pgpass", "~/.npmrc", "~/.pypirc",  # 各类凭据
+    "~/.ssh/",
+    "~/.env",
+    "~/.bashrc", "~/.zshrc", "~/.profile", "~/.bash_profile", "~/.zprofile",
+    "~/.netrc", "~/.pgpass", "~/.npmrc", "~/.pypirc",
 )
-# 项目级 .env / config 的精确后缀判断在 check_write_path 内做（含 .example 模板白名单）
+
+_SENSITIVE_PROJECT_BASENAMES = {".env", ".env.local", "config.yaml"}
 
 
 def check_write_path(path: str) -> Optional[str]:
-    """写操作路径安全检查。返回 ``None`` 放行，返回 ``str`` 为拒绝消息。
-
-    对应 hermes ``_check_sensitive_path``（file_tools.py:443）+ shell 侧敏感写入目标的合并。
-    被 ``tools/_permission.py`` 在 write_file / patch 执行前调用。
-
-    Args:
-        path: 工具传入的目标路径（可为绝对/相对/~ 开头）。
-
-    Returns:
-        ``None`` = 放行；非空字符串 = 拒绝原因（写给模型看）。
-    """
-    # 1. resolve：跟符号链接 + 归一化 .. —— 防符号链接绕过
+    """检查原生文件工具的写入目标；返回 ``None`` 放行，否则返回拒绝原因。"""
     try:
-        resolved = resolve(path)
-        resolved_str = str(resolved.resolve())  # resolve() 已 join cwd，再 .resolve() 跟符号链接
-    except (OSError, ValueError):
-        resolved_str = path  # resolve 失败时退化到原始字符串比对（fail-open，与 hermes 一致）
+        resolved_str = os.path.realpath(resolve(path))
+    except (OSError, TypeError, ValueError):
+        resolved_str = os.path.abspath(os.path.expanduser(str(path)))
 
-    # 2. 系统敏感路径前缀/精确匹配（realpath 后）
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved_str.startswith(prefix):
             return (
@@ -106,30 +50,21 @@ def check_write_path(path: str) -> Optional[str]:
             "（如 docker.sock 等服务控制接口）"
         )
 
-    # 3. 用户/项目敏感写入目标（~ 展开 + normpath 后匹配）
-    #    用 os.path.normpath 归一化 .././ 等，与 hermes _check_sensitive_path 的双路径比对一致
-    import os
-    normalized = os.path.normpath(os.path.expanduser(path))
+    # 用户敏感路径也使用 realpath；否则工作区符号链接可绕到 ~/.ssh。
     for target in _SENSITIVE_USER_WRITES:
-        target_norm = os.path.normpath(os.path.expanduser(target))
-        # 精确匹配（如 ~/.bashrc）或前缀匹配（如 ~/.ssh/ 下任意文件）
-        if normalized == target_norm or normalized.startswith(target_norm + "/"):
+        target_real = os.path.realpath(os.path.expanduser(target))
+        if resolved_str == target_real or resolved_str.startswith(target_real + os.sep):
             return (
                 f"拒绝写入敏感文件: {path}\n"
                 "（SSH 密钥、shell 配置、凭据文件或 .env）—— "
                 "写入这些文件可被用于植入后门或窃取凭据。如确需修改请手动操作。"
             )
-    # 项目级 .env / config.yaml：任意目录下的（宽松 endsuffix，覆盖子目录）
-    # .env / .env.local / config.yaml 算敏感（拦）；.env.example / .env.sample 是模板（放行）
-    _SENSITIVE_PROJECT_SUFFIXES = ("/.env", "/config.yaml")
-    _TEMPLATE_SUFFIXES = (".example", ".sample")
-    # 先排除模板文件（.env.example / config.yaml.sample 等）
-    if not normalized.endswith(_TEMPLATE_SUFFIXES):
-        for suffix in _SENSITIVE_PROJECT_SUFFIXES:
-            if normalized.endswith(suffix) or normalized.endswith(suffix + ".local"):
-                return (
-                    f"拒绝写入项目配置文件: {path}\n"
-                    "（.env / config.yaml 含敏感配置）—— 如确需修改请手动操作。"
-                )
+
+    # basename 判断同时覆盖仓库根目录和子目录；.env.example 等模板不会命中。
+    if Path(resolved_str).name in _SENSITIVE_PROJECT_BASENAMES:
+        return (
+            f"拒绝写入项目配置文件: {path}\n"
+            "（.env / config.yaml 含敏感配置）—— 如确需修改请手动操作。"
+        )
 
     return None

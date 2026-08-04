@@ -194,22 +194,20 @@ def _normalize_command_for_detection(command: str) -> str:
 # ════════════════════════════════════════════════════════════════════════
 # 5. sudo stdin guard（防 sudo 密码爆破）
 # ════════════════════════════════════════════════════════════════════════
-# 来源：hermes approval.py:310-331。未配 SUDO_PASSWORD 时，任何 ``sudo -S``
-# 都是模型在管道传输猜测的密码 —— 暴力破解向量。无条件拒绝。
+# Hermes 只有在 terminal 层真正完成 ``sudo -S`` 命令改写和 stdin 密码注入后，
+# 才会因 SUDO_PASSWORD 已配置而放行。本项目 bash 工具没有这条注入链，因此任何
+# 显式 ``sudo -S`` 都拒绝，避免“配置存在但实际未使用”的半实现。
 _SUDO_STDIN_RE = re.compile(
     r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b',
     re.IGNORECASE)
 
 
 def _check_sudo_stdin_guard(command: str) -> Tuple[bool, Optional[str]]:
-    """检测无配置 SUDO_PASSWORD 时的 ``sudo -S``（stdin 密码）。
+    """检测显式 ``sudo -S``；当前项目不支持安全的密码 stdin 注入。
 
     Returns:
         (is_blocked, description) —— 被拦时 description 非空。
     """
-    # 检查环境变量配置文件里面是否配置了管理员密码
-    if "SUDO_PASSWORD" in os.environ:
-        return (False, None)  # 已配置密码，-S 由内部注入，合法
     normalized = _normalize_command_for_detection(command).lower()
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "尝试通过 stdin 获取 sudo 密码 (sudo -S)")
@@ -268,7 +266,6 @@ def _approve_session(pattern_key: str) -> None:
     """把 pattern_key 记进本会话的已批准集合。"""
     with _session_lock:
         _session_approved.setdefault(_SESSION_KEY, set()).add(pattern_key)
-
 
 def clear_session() -> None:
     """清空本会话的审批记忆（测试/重置用）。"""
@@ -338,7 +335,7 @@ def check_command(command: str) -> Optional[str]:
         return (
             f"拒绝: {sudo_desc}。\n"
             "不要向 'sudo -S' 管道传输密码 —— 这是暴力破解向量。"
-            "如 agent 需要 sudo，请在 .env 配 SUDO_PASSWORD，或手动在终端执行。"
+            "当前 bash 工具不注入 sudo 密码；如确需提权，请在 agent 外手动执行。"
         )
 
     # 2. HARDLINE 地板

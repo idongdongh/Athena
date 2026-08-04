@@ -5,8 +5,8 @@
 - 自动创建父目录
 - 返回 bytes_written / dirs_created
 
-砍掉的 hermes 壳（留待权限层/后续）：lint/LSP 诊断、CRLF/BOM 保留、原子写（temp+rename）、
-敏感路径/cross_profile 拦截。后端用纯 Python pathlib（hermes 走 shell）。
+未保留的 Hermes 能力：lint/LSP 诊断、CRLF/BOM 保留、原子写（temp+rename）、
+cross_profile 隔离。敏感路径由统一权限层拦截；后端使用 Python pathlib。
 """
 
 import json
