@@ -28,13 +28,18 @@ tool_use → preflight → handler（可并发）→ 主线程顺序归并
 
 `ToolOutcome` 明确区分：`succeeded`、`failed`、`blocked`、`unknown`、
 `internal_error` 与 `cancelled`。其中策略或用户权限拒绝属于 `blocked`，不会被误计为
-工具执行失败；未知工具和 handler 异常则会计入重复失败保护。
+工具执行失败。工具执行失败和 handler 异常会进入重复失败保护；未知工具由对话循环按
+连续模型轮次独立限制。
 
 文件修改会在同一轮内追踪：某路径的 `write_file` 或 `patch` 失败后，只有后续成功写入
 同一路径才会清除失败状态。最终回答会披露仍未恢复的失败，避免模型在部分修改失败时声称
 任务已全部完成。
 
-环境变量：
+工具循环阈值在项目根目录 `config.yaml` 的 `tool_loop_guardrails` 中配置。
+配置结构与 Hermes 一致，包含 `warnings_enabled`、`hard_stop_enabled`、
+`warn_after` 和 `hard_stop_after`。配置在进程启动时读取一次；修改后需要重启 Agent。
+
+环境变量可以覆盖 YAML 中的两个开关：
 
 - `TOOL_GUARDRAIL_WARNINGS`：是否追加重复失败提示，默认 `true`。
 - `TOOL_GUARDRAIL_HARD_STOP`：是否在达到阈值时熔断，默认 `true`。

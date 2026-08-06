@@ -1,7 +1,7 @@
 """工具调用重复检测控制器（per-turn 状态机）。
 
-核心状态机参考 Hermes ``agent/tool_guardrails.py``。本项目通过环境变量控制
-warning 和 hard stop，不支持从 YAML 配置各项阈值。
+核心状态机和 ``tool_loop_guardrails`` YAML 结构参考 Hermes
+``agent/tool_guardrails.py``；环境变量可以覆盖 warning 和 hard stop 开关。
 
 重复检测分为三类：
 - **精确失败重复**：同一工具、相同参数连续失败，先警告，达到上限后 block。在工具调用结果提示正确情况下，用来检测模型是否重复输出相同调用。
@@ -22,15 +22,15 @@ warning 和 hard stop，不支持从 YAML 配置各项阈值。
 就结束当前 turn。控制器只保留本 turn 内出现的第一个停止决策，并在下一条
 用户请求开始时重置。
 
-与 Hermes 完整实现相比，本项目未包含 ``ToolCallGuardrailConfig.from_mapping``、
-插件回调和独立观测存储；Hermes 的 ``terminal`` 工具在本项目中对应 ``bash``。
+与 Hermes 完整实现相比，本项目未包含插件回调和独立观测存储；Hermes 的
+``terminal`` 工具在本项目中对应 ``bash``。
 """
 
 import hashlib
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
 from agent.tool_result_classification import classify_tool_result
@@ -50,14 +50,14 @@ IDEMPOTENT_TOOL_NAMES = frozenset({
 })
 
 # ════════════════════════════════════════════════════════════════════════
-# 配置（保持精简，支持环境变量开关）
+# 配置（Hermes YAML 结构 + 环境变量开关覆盖）
 # ════════════════════════════════════════════════════════════════════════
 # 阈值试验调出来的经验值。对齐 hermes ToolCallGuardrailConfig 默认。
-# warn 永远开（不阻断，只追加提示）；hard_stop 默认也开（CLI 阶段够用）。
+# warnings 和 hard stop 默认开启，也可由 YAML 或环境变量关闭。
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
-    """重复检测阈值。环境变量仅提供 warnings_enabled 和 hard_stop_enabled 两个开关，不引入完整 YAML 配置系统。"""
+    """重复检测阈值。YAML 配置结构与 Hermes ``tool_loop_guardrails`` 一致。"""
     warnings_enabled: bool = True
     hard_stop_enabled: bool = True          # 开启强制阻断模式，也就是默认开 block/halt
     exact_failure_warn_after: int = 2       # 在 2 次精确工具调用失败后触发 → warn
@@ -66,7 +66,74 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8   # 同 name 失败 8 次 → halt
     no_progress_warn_after: int = 2         # 只读无进展 2 次 → warn
     no_progress_block_after: int = 5        # 只读无进展 5 次 → block
-    invalid_tool_halt_after: int = 3        # 未知工具累计 3 次 → halt
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
+        """从 ``tool_loop_guardrails`` mapping 加载配置。"""
+        if not isinstance(data, Mapping):
+            return cls()
+
+        warn_after = data.get("warn_after")
+        if not isinstance(warn_after, Mapping):
+            warn_after = {}
+        hard_stop_after = data.get("hard_stop_after")
+        if not isinstance(hard_stop_after, Mapping):
+            hard_stop_after = {}
+        defaults = cls()
+        return cls(
+            warnings_enabled=_as_bool(
+                data.get("warnings_enabled"), defaults.warnings_enabled
+            ),
+            hard_stop_enabled=_as_bool(
+                data.get("hard_stop_enabled"), defaults.hard_stop_enabled
+            ),
+            exact_failure_warn_after=_positive_int(
+                warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
+                defaults.exact_failure_warn_after,
+            ),
+            same_tool_failure_warn_after=_positive_int(
+                warn_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_warn_after")
+                ),
+                defaults.same_tool_failure_warn_after,
+            ),
+            no_progress_warn_after=_positive_int(
+                warn_after.get(
+                    "idempotent_no_progress", data.get("no_progress_warn_after")
+                ),
+                defaults.no_progress_warn_after,
+            ),
+            exact_failure_block_after=_positive_int(
+                hard_stop_after.get(
+                    "exact_failure", data.get("exact_failure_block_after")
+                ),
+                defaults.exact_failure_block_after,
+            ),
+            same_tool_failure_halt_after=_positive_int(
+                hard_stop_after.get(
+                    "same_tool_failure", data.get("same_tool_failure_halt_after")
+                ),
+                defaults.same_tool_failure_halt_after,
+            ),
+            no_progress_block_after=_positive_int(
+                hard_stop_after.get(
+                    "idempotent_no_progress", data.get("no_progress_block_after")
+                ),
+                defaults.no_progress_block_after,
+            ),
+        )
+
+    def with_environment_overrides(self) -> "ToolCallGuardrailConfig":
+        """仅在环境变量显式存在时覆盖 YAML 中的两个开关。"""
+        return replace(
+            self,
+            warnings_enabled=_env_bool(
+                "TOOL_GUARDRAIL_WARNINGS", self.warnings_enabled
+            ),
+            hard_stop_enabled=_env_bool(
+                "TOOL_GUARDRAIL_HARD_STOP", self.hard_stop_enabled
+            ),
+        )
 
     @classmethod
     def from_environment(cls) -> "ToolCallGuardrailConfig":
@@ -75,11 +142,7 @@ class ToolCallGuardrailConfig:
         Returns:
             ToolCallGuardrailConfig: ToolCallGuardrailConfig 类对象
         """
-        defaults = cls()
-        return cls(
-            warnings_enabled=_env_bool("TOOL_GUARDRAIL_WARNINGS", defaults.warnings_enabled),
-            hard_stop_enabled=_env_bool("TOOL_GUARDRAIL_HARD_STOP", defaults.hard_stop_enabled),
-        )
+        return cls().with_environment_overrides()
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -213,7 +276,6 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
-        self._invalid_tool_count = 0
         self._halt_decision: Optional[ToolGuardrailDecision] = None
 
     @property  # 把方法变成属性
@@ -232,42 +294,6 @@ class ToolCallGuardrailController:
         with self._halt_lock:
             if self._halt_decision is None:
                 self._halt_decision = decision
-
-    def record_unknown_tool(self, tool_name: str) -> ToolGuardrailDecision:
-        """记录一次未知工具调用；连续猜测工具名达到阈值后终止本 turn。"""
-        self._invalid_tool_count += 1
-        count = self._invalid_tool_count
-        signature = ToolCallSignature.from_call(tool_name, {})
-
-        if self.config.hard_stop_enabled and count >= self.config.invalid_tool_halt_after:
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="invalid_tool_halt",
-                message=(
-                    f"本 turn 已调用不存在的工具 {count} 次。"
-                    "停止猜测工具名称，只能从可用工具列表中选择。"
-                ),
-                tool_name=tool_name,
-                count=count,
-                signature=signature,
-            )
-            self._set_halt(decision)
-            return decision
-
-        if self.config.warnings_enabled:
-            return ToolGuardrailDecision(
-                action="warn",
-                code="invalid_tool_warning",
-                message=(
-                    f"{tool_name} 不是已注册工具（本 turn 第 {count} 次）。"
-                    "请从可用工具列表中选择，不要继续猜测工具名称。"
-                ),
-                tool_name=tool_name,
-                count=count,
-                signature=signature,
-            )
-
-        return ToolGuardrailDecision(tool_name=tool_name, count=count, signature=signature)
 
     # ── before_call：执行前检查 ───────────────────────────────────────────
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
@@ -514,3 +540,31 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off", "disabled"}:
         return False
     return default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """安全解析 YAML 布尔值。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """安全解析正整数阈值，非法值回退默认值。"""
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 1 else default

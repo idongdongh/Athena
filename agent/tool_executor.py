@@ -6,11 +6,16 @@ handler 可以并发运行，但所有共享状态都由主线程按模型原始
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import logging
+import math
+import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
-from typing import Any, List
+from typing import Any, Callable, List
 
 from agent.file_mutation_tracker import FileMutationTracker
+from agent.config_loader import load_config
 from agent.tool_guardrails import (
     IDEMPOTENT_TOOL_NAMES,
     ToolCallGuardrailConfig,
@@ -20,6 +25,7 @@ from agent.tool_guardrails import (
 )
 from agent.tool_result_classification import (
     BLOCKED,
+    CANCELLED,
     INTERNAL_ERROR,
     UNKNOWN,
     ToolOutcome,
@@ -31,9 +37,24 @@ from tools.registry import registry
 
 TURN_BUDGET_CHARS = 300_000
 
-# 每条用户请求开始时由 conversation_loop 初始化。
-tool_guardrails = ToolCallGuardrailController(ToolCallGuardrailConfig.from_environment())
+# 每条用户请求开始时由 conversation_loop 重置状态；配置在进程启动时读取一次。
+_project_config = load_config()
+tool_guardrails = ToolCallGuardrailController(
+    ToolCallGuardrailConfig.from_mapping(
+        _project_config.get("tool_loop_guardrails")
+    ).with_environment_overrides()
+)
 file_mutation_tracker = FileMutationTracker()
+
+_TOOL_ERROR_ROLE_TAG_RE = re.compile(
+    r"</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>",
+    re.IGNORECASE,
+)
+_TOOL_ERROR_FENCE_RE = re.compile(r"```(?:json|xml|html|markdown)?", re.IGNORECASE)
+_TOOL_ERROR_CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+_TOOL_ERROR_MAX_LEN = 2000
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 @dataclass(frozen=True)
@@ -44,6 +65,105 @@ class RawToolExecution:
     status: str | None = None
 
 
+def _sanitize_tool_error(error_message: str) -> str:
+    """清除异常中的结构标记并限制长度，避免错误文本干扰模型消息结构。"""
+    sanitized = _TOOL_ERROR_ROLE_TAG_RE.sub("", error_message)
+    sanitized = _TOOL_ERROR_FENCE_RE.sub("", sanitized)
+    sanitized = _TOOL_ERROR_CDATA_RE.sub("", sanitized)
+    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
+        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+    return f"[TOOL_ERROR] {sanitized}"
+
+
+def _schema_allows_null(schema: dict) -> bool:
+    """JSON Schema 字段是否显式允许 null。"""
+    schema_type = schema.get("type")
+    if schema_type == "null" or schema.get("nullable") is True:
+        return True
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return True
+    for key in ("anyOf", "oneOf"):
+        options = schema.get(key)
+        if isinstance(options, list) and any(
+            isinstance(option, dict) and option.get("type") == "null"
+            for option in options
+        ):
+            return True
+    return False
+
+
+def _coerce_tool_value(value: str, expected_type: Any, schema: dict) -> Any:
+    """按单个字段的 schema 安全转换字符串；无法确定时保留原值。"""
+    if _schema_allows_null(schema) and value.strip().lower() == "null":
+        return None
+
+    if isinstance(expected_type, list):
+        for candidate in expected_type:
+            converted = _coerce_tool_value(value, candidate, schema)
+            if converted is not value:
+                return converted
+        return value
+
+    if expected_type in {"integer", "number"}:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return value
+        if not math.isfinite(number):
+            return value
+        if number.is_integer():
+            return int(number)
+        return value if expected_type == "integer" else number
+
+    if expected_type == "boolean":
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return value
+
+    expected_python_type = {"array": list, "object": dict}.get(expected_type)
+    if expected_python_type is not None:
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        return parsed if isinstance(parsed, expected_python_type) else value
+
+    return value
+
+
+def coerce_tool_args(tool_name: str, args: dict) -> dict:
+    """根据注册工具的 input_schema 安全转换参数类型，不修改原始参数。"""
+    converted_args = dict(args)
+    entry = registry.get_entry(tool_name)
+    if entry is None:
+        return converted_args
+    input_schema = entry.schema.get("input_schema")
+    if not isinstance(input_schema, dict):
+        return converted_args
+    properties = input_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return converted_args
+
+    for key, value in list(converted_args.items()):
+        schema = properties.get(key)
+        if not isinstance(schema, dict):
+            continue
+        expected_type = schema.get("type")
+        if expected_type == "array" and value is not None and not isinstance(value, (list, tuple)):
+            if isinstance(value, str):
+                converted = _coerce_tool_value(value, expected_type, schema)
+                converted_args[key] = [value] if converted is value else converted
+            else:
+                converted_args[key] = [value]
+            continue
+        if isinstance(value, str):
+            converted_args[key] = _coerce_tool_value(value, expected_type, schema)
+    return converted_args
+
+
 def _execute_raw_tool_call(name: str, args: dict) -> RawToolExecution:
     """只执行 handler，不分类结果，不访问任何共享状态。"""
     entry = registry.get_entry(name)
@@ -52,7 +172,14 @@ def _execute_raw_tool_call(name: str, args: dict) -> RawToolExecution:
     try:
         output = entry.handler(**args)
     except Exception as exc:
-        return RawToolExecution(f"Error: {exc}", INTERNAL_ERROR)
+        logger.exception("Tool %s execution failed", name)
+        error = _sanitize_tool_error(
+            f"Tool execution failed: {type(exc).__name__}: {exc}"
+        )
+        return RawToolExecution(
+            json.dumps({"error": error}, ensure_ascii=False),
+            INTERNAL_ERROR,
+        )
     return RawToolExecution(output)
 
 
@@ -67,6 +194,7 @@ def dispatch_tool_call(name: str, args: dict) -> str:
     与批量路径使用同一契约：记录调用、执行 preflight、更新
     guardrail / 文件状态 / trace，防止兼容调用方绕过权限边界。
     """
+    args = coerce_tool_args(name, args)
     get_tracer().tool_call(name, args)
     outcome = _preflight_call(name, args)
     if outcome is None:
@@ -77,6 +205,15 @@ def dispatch_tool_call(name: str, args: dict) -> str:
 def _blocked_outcome(name: str, content: str, code: str) -> ToolOutcome:
     """阻塞结果合成"""
     return ToolOutcome(name, content, BLOCKED, code, content)
+
+
+def _cancelled_outcome(name: str, reason: str) -> ToolOutcome:
+    """为未执行的工具调用生成协议完整的取消结果。"""
+    return classify_tool_result(
+        name,
+        f"[Tool execution cancelled: {reason}]",
+        status=CANCELLED,
+    )
 
 
 def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
@@ -100,8 +237,8 @@ def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
         print(f"\033[33m⚠️  guardrail block: {decision.message}\033[0m")
         return _blocked_outcome(name, content, decision.code)
 
-    # 未注册工具不进入执行阶段，但仍在归并阶段计入失败，抑制模型反复调用不存在的工具（幻觉调用）。
-    # 归并阶段：把不同工具、不同线程返回的结果，统一分类、更新状态，并按正确顺序组成模型下一轮需要的消息。
+    # conversation loop 会按模型轮次处理未知工具；这里保留兜底，确保兼容入口
+    # 或注册表变化时仍不执行 handler，并返回可恢复的明确错误。
     if registry.get_entry(name) is None:
         available_tools = ", ".join(registry.names()) or "(none)"
         return classify_tool_result(
@@ -119,9 +256,7 @@ def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
 
 def _finalize_outcome(outcome: ToolOutcome, args: dict) -> ToolOutcome:
     """最终确定结果：主线程顺序归并一个结果，更新所有 per-turn 共享状态。"""
-    if outcome.status == UNKNOWN:
-        decision = tool_guardrails.record_unknown_tool(outcome.tool_name)
-    elif outcome.status != BLOCKED:
+    if outcome.status not in {BLOCKED, CANCELLED, UNKNOWN}:
         decision = tool_guardrails.after_call(
             outcome.tool_name,
             args,
@@ -190,6 +325,7 @@ def execute_tool_calls(
     messages: List[Any],
     concurrent: bool = False,
     max_workers: int = 4,
+    is_cancelled: Callable[[], bool] = lambda: False,
 ) -> None:
     """执行一批 tool_use，并按模型原顺序归并结果后写回 messages。"""
 
@@ -200,43 +336,75 @@ def execute_tool_calls(
     for call in calls:
         print(f"use_tool:\033[33m{call.name}\033[0m\n")
 
+    prepared_args = [coerce_tool_args(call.name, call.input) for call in calls]
+
     # 顺序执行路径必须逐个 preflight（预检） → 执行 → 归并，才能让第 N 次重复调用在
     # 同一批次内也看到前 N-1 次的失败计数。
     if not concurrent or not _should_parallelize_tool_batch(calls):
         outcomes: list[ToolOutcome] = []
-        for call in calls:
-            get_tracer().tool_call(call.name, call.input)
-            outcome = _preflight_call(call.name, call.input)
-            if outcome is None:
-                outcome = _classify_raw_execution(
+        for call, args in zip(calls, prepared_args):
+            get_tracer().tool_call(call.name, args)
+            if is_cancelled():
+                outcome = _cancelled_outcome(
                     call.name,
-                    _execute_raw_tool_call(call.name, call.input),
+                    "not started due to user interrupt",
                 )
-            outcomes.append(_finalize_outcome(outcome, call.input))
+            else:
+                outcome = _preflight_call(call.name, args)
+                if outcome is None:
+                    outcome = _classify_raw_execution(
+                        call.name,
+                        _execute_raw_tool_call(call.name, args),
+                    )
+            outcomes.append(_finalize_outcome(outcome, args))
     else:
         # 并发执行路径在启动 worker 前完成所有 preflight；worker 仅执行 handler。
         raw_outcomes: list[RawToolExecution | ToolOutcome | None] = [None] * len(calls)
-        executable: list[tuple[int, Any]] = []
-        for index, call in enumerate(calls):
-            get_tracer().tool_call(call.name, call.input)
-            preflight = _preflight_call(call.name, call.input)
+        executable: list[tuple[int, Any, dict]] = []
+        for index, (call, args) in enumerate(zip(calls, prepared_args)):
+            get_tracer().tool_call(call.name, args)
+            if is_cancelled():
+                raw_outcomes[index] = _cancelled_outcome(
+                    call.name,
+                    "not started due to user interrupt",
+                )
+                continue
+            preflight = _preflight_call(call.name, args)
             if preflight is None:
-                executable.append((index, call))
+                executable.append((index, call, args))
             else:
                 raw_outcomes[index] = preflight
 
         if executable:
             with ThreadPoolExecutor(max_workers=min(max_workers, len(executable))) as executor:
                 futures = {
-                    executor.submit(_execute_raw_tool_call, call.name, call.input): index
-                    for index, call in executable
+                    executor.submit(_execute_raw_tool_call, call.name, args): index
+                    for index, call, args in executable
                 }
-                for future in as_completed(futures):
-                    raw_outcomes[futures[future]] = future.result()
+                pending = set(futures)
+                while pending:
+                    if is_cancelled():
+                        for future in list(pending):
+                            if future.cancel():
+                                index = futures[future]
+                                raw_outcomes[index] = _cancelled_outcome(
+                                    calls[index].name,
+                                    "not started due to user interrupt",
+                                )
+                                pending.remove(future)
+                    if not pending:
+                        break
+                    completed, pending = wait(
+                        pending,
+                        timeout=0.1,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        raw_outcomes[futures[future]] = future.result()
 
         # 所有 stateful 操作都在主线程、模型原始调用顺序中完成。
         outcomes = []
-        for call, raw_or_outcome in zip(calls, raw_outcomes):
+        for call, args, raw_or_outcome in zip(calls, prepared_args, raw_outcomes):
             # worker 已隔离 handler 异常；这里仍保留兜底，确保每个 tool_use
             # 必有一个对应 tool_result，不会破坏 API 协议。
             if raw_or_outcome is None:
@@ -249,7 +417,7 @@ def execute_tool_calls(
                 outcome = _classify_raw_execution(call.name, raw_or_outcome)
             else:
                 outcome = raw_or_outcome
-            outcomes.append(_finalize_outcome(outcome, call.input))
+            outcomes.append(_finalize_outcome(outcome, args))
     results = [
         {"type": "tool_result", "tool_use_id": call.id, "content": outcome.content}
         for call, outcome in zip(calls, outcomes)

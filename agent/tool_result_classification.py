@@ -96,9 +96,22 @@ def classify_tool_result(
         }.get(status)
         return ToolOutcome(tool_name, text, status, code, text or None)
 
+    # Hermes 会把成功但没有正文的工具结果规范化为明确占位文本。
+    # 空结果不等于失败：部分命令成功执行后本来就不会产生输出。
+    if not text.strip():
+        text = "(no output)"
+        if tool_name in FILE_MUTATING_TOOL_NAMES:
+            return ToolOutcome(
+                tool_name,
+                text,
+                FAILED,
+                "empty_mutation_result",
+                "写工具没有返回可验证的落盘结果",
+            )
+
     try:
         data = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError):
         data = None
 
     # 与 Hermes terminal 语义一致：非零退出码是 bash 的权威失败信号。

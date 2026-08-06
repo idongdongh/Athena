@@ -13,6 +13,11 @@ from prompt_toolkit.history import InMemoryHistory
 load_dotenv(override=True)
 
 from tools.registry import registry, discover
+from agent.provider_error_recovery import (
+    ProviderRequestFailed,
+    ProviderRequestInterrupted,
+    request_with_retries,
+)
 from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
 from agent.tracer import reset_tracer, get_tracer
 
@@ -29,7 +34,8 @@ if not _model_id:
         "MODEL_ID 未设置。请在项目根 .env 配置后重试。"
     )
 
-client = Anthropic(base_url=os.getenv("BASE_URL"), api_key=_api_key)
+# 重试统一由 provider_error_recovery 管理，避免 SDK 内置重试与外层重试相乘。
+client = Anthropic(base_url=os.getenv("BASE_URL"), api_key=_api_key, max_retries=0)
 MODEL_ID = _model_id
 
 
@@ -101,6 +107,42 @@ def _assistant_text(res):
                    if getattr(b, "type", None) == "text")
 
 
+def _is_empty_model_response(res) -> bool:
+    """模型响应是否既没有工具调用，也没有非空文本。"""
+    has_tool_call = any(isinstance(block, ToolUseBlock) for block in res.content)
+    return not has_tool_call and not _assistant_text(res).strip()
+
+
+def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
+    """发现未知工具时返回整批 synthetic results；全部合法时返回 None。"""
+    invalid_names = {call.name for call in tool_calls if registry.get_entry(call.name) is None}
+    if not invalid_names:
+        return None
+
+    available = ", ".join(registry.names()) or "(none)"
+    results = []
+    for call in tool_calls:
+        if call.name in invalid_names:
+            if not call.name.strip():
+                content = (
+                    "Tool call rejected: the tool name was empty. "
+                    "Use a valid name from the available tool list."
+                )
+            else:
+                content = f"Unknown tool: {call.name}. Available tools: {available}"
+        else:
+            content = (
+                "Skipped: another tool call in this batch used an invalid name. "
+                "Please retry this tool call."
+            )
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": call.id,
+            "content": content,
+        })
+    return results
+
+
 def _append_file_mutation_notice(messages) -> None:
     """在最终回答后追加仍未恢复的文件修改失败，避免模型过度声称完成。"""
     notice = file_mutation_tracker.format_notice()
@@ -108,6 +150,22 @@ def _append_file_mutation_notice(messages) -> None:
         return
     # 必须修改同一条 assistant 消息：相邻的 assistant 消息会破坏 API 的角色交替约束。
     messages[-1]["content"].append(TextBlock(type="text", text=notice))
+
+
+def _create_message_with_recovery(**kwargs):
+    """调用模型 Provider，并对暂时性错误执行有界重试。"""
+    def on_retry(error, retry_number, wait_seconds):
+        print(
+            f"\033[33m⚠️  API {error.kind}，{wait_seconds:.1f} 秒后重试 "
+            f"（{retry_number}/3）\033[0m"
+        )
+
+    return request_with_retries(
+        lambda: client.messages.create(**kwargs),
+        max_retries=3,
+        is_interrupted=lambda: _interrupt_requested,
+        on_retry=on_retry,
+    )
 
 
 def agent_loop(messages):
@@ -126,12 +184,15 @@ def agent_loop(messages):
 
     api_call_count = 0
     exit_reason = None
+    awaiting_tool_followup = False
+    post_tool_empty_retried = False
+    invalid_tool_retries = 0
 
     try:
         while api_call_count < MAX_ITERATIONS and not _interrupt_requested:
             api_call_count += 1
             tr.step_start(api_call_count, len(messages), True, query=_last_user_text(messages))
-            res = client.messages.create(
+            res = _create_message_with_recovery(
                 model=MODEL_ID,
                 messages=messages,
                 system=SYSTEM,
@@ -140,7 +201,6 @@ def agent_loop(messages):
                 timeout=API_TIMEOUT,
             )
 
-            messages.append({"role": "assistant", "content": res.content})
             tr.step_done(
                 res.stop_reason,
                 # 模型要调用的所有工具名称
@@ -148,6 +208,38 @@ def agent_loop(messages):
                 # 模型回复的 text（str）
                 assistant_text=_assistant_text(res),
             )
+
+            if awaiting_tool_followup and _is_empty_model_response(res):
+                if not post_tool_empty_retried:
+                    post_tool_empty_retried = True
+                    messages.extend([
+                        {
+                            "role": "assistant",
+                            "content": [TextBlock(type="text", text="(empty response)")],
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous response was empty. Process the tool results "
+                                "and provide a complete answer to the user."
+                            ),
+                        },
+                    ])
+                    print("\033[33m⚠️  模型在工具执行后返回空回复，正在补救一次...\033[0m")
+                    continue
+
+                messages.append({
+                    "role": "assistant",
+                    "content": [TextBlock(
+                        type="text",
+                        text="[模型在工具执行后连续返回空回复，本轮已停止]",
+                    )],
+                })
+                exit_reason = "post_tool_empty_response"
+                break
+
+            messages.append({"role": "assistant", "content": res.content})
+            awaiting_tool_followup = False
 
             if res.stop_reason != "tool_use":
                 exit_reason = "completed"
@@ -158,13 +250,41 @@ def agent_loop(messages):
                 exit_reason = "interrupted"
                 break
 
+            tool_calls = [
+                block for block in res.content if isinstance(block, ToolUseBlock)
+            ]
+            invalid_results = _invalid_tool_results(tool_calls)
+            if invalid_results is not None:
+                invalid_tool_retries += 1
+                messages.append({"role": "user", "content": invalid_results})
+                print(
+                    "\033[33m⚠️  模型调用了未知工具，已返回可用工具列表 "
+                    f"（{invalid_tool_retries}/3）\033[0m"
+                )
+                if invalid_tool_retries >= 3:
+                    messages.append({
+                        "role": "assistant",
+                        "content": [TextBlock(
+                            type="text",
+                            text="[模型连续三轮调用未知工具，本轮已停止]",
+                        )],
+                    })
+                    exit_reason = "invalid_tool_limit"
+                    break
+                awaiting_tool_followup = True
+                continue
+
+            invalid_tool_retries = 0
+
             # 把本轮 tool_use 块交给执行引擎调度，结果回写 messages
             execute_tool_calls(
                 res.content,
                 messages,
                 concurrent=CONCURRENT_TOOLS,
                 max_workers=TOOL_MAX_WORKERS,
+                is_cancelled=lambda: _interrupt_requested,
             )
+            awaiting_tool_followup = True
 
             # 与 Hermes 一致：guardrail halt 是一个明确的受控结束，不再额外调用模型总结。
             halt_decision = tool_guardrails.halt_decision
@@ -180,7 +300,9 @@ def agent_loop(messages):
                 break
 
         # 正常完成和 guardrail 受控结束都已有最终 assistant 消息，直接返回。
-        if exit_reason in {"completed", "guardrail_halt"}:
+        if exit_reason in {
+            "completed", "guardrail_halt", "post_tool_empty_response", "invalid_tool_limit",
+        }:
             _append_file_mutation_notice(messages)
             tr.finish(exit_reason, api_call_count)
             return
@@ -191,7 +313,7 @@ def agent_loop(messages):
         else:
             label = f"iteration budget exhausted ({api_call_count}/{MAX_ITERATIONS})"
         print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
-        res = client.messages.create(
+        res = _create_message_with_recovery(
             model=MODEL_ID,  # type: ignore
             messages=messages,
             system=SYSTEM,
@@ -202,6 +324,25 @@ def agent_loop(messages):
         _append_file_mutation_notice(messages)
         tr.finish(label, api_call_count)
 
+    except ProviderRequestInterrupted:
+        get_tracer().finish("provider_retry_interrupted", api_call_count)
+        messages.append({
+            "role": "assistant",
+            "content": [TextBlock(type="text", text="[API 重试已被用户中断]")],
+        })
+    except ProviderRequestFailed as exc:
+        error = exc.error
+        detail = str(exc.cause).replace("\n", " ")[:500]
+        message = f"模型服务请求失败（{error.kind}）"
+        if error.status_code is not None:
+            message += f"，HTTP {error.status_code}"
+        if detail:
+            message += f"：{detail}"
+        get_tracer().finish(f"provider_error:{error.kind}", api_call_count)
+        messages.append({
+            "role": "assistant",
+            "content": [TextBlock(type="text", text=message)],
+        })
     except KeyboardInterrupt:
         get_tracer().finish("force_quit", api_call_count)
         # 第二次 Ctrl+C（_on_interrupt 已把 SIGINT 复位为 SIG_DFL）：强制中断，不崩 REPL

@@ -28,6 +28,7 @@ from agent.tool_guardrails import (
 )
 from agent.tool_result_classification import (
     BLOCKED,
+    CANCELLED,
     FAILED,
     INTERNAL_ERROR,
     SUCCESS,
@@ -100,6 +101,31 @@ class _FailingPatchThenDoneAPI:
         return SimpleNamespace(stop_reason="end_turn", content=[TextBlock(type="text", text="all done")])
 
 
+class _PostToolEmptyThenDoneAPI:
+    def __init__(self, stay_empty=False):
+        self.calls = []
+        self.stay_empty = stay_empty
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[ToolUseBlock(
+                    type="tool_use",
+                    id="empty-followup-call",
+                    name="empty_probe",
+                    input={},
+                )],
+            )
+        if len(self.calls) == 2 or self.stay_empty:
+            return SimpleNamespace(stop_reason="end_turn", content=[])
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[TextBlock(type="text", text="recovered answer")],
+        )
+
+
 class _FakeTavily:
     def __init__(self, **kwargs):
         pass
@@ -113,6 +139,9 @@ class _FakeTavily:
 
 
 class LogicRegressionTests(unittest.TestCase):
+    def test_anthropic_sdk_retries_are_disabled(self):
+        self.assertEqual(conversation_loop.client.max_retries, 0)
+
     def test_normal_end_turn_does_not_request_summary(self):
         fake_client = SimpleNamespace(messages=_FakeMessagesAPI())
         messages = [{"role": "user", "content": "hello"}]
@@ -126,6 +155,27 @@ class LogicRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(fake_client.messages.calls), 1)
         self.assertEqual(messages[-1]["content"][0].text, "done")
+
+    def test_permanent_provider_error_returns_controlled_assistant_message(self):
+        class AuthenticationError(Exception):
+            status_code = 401
+            response = None
+
+        class FailingMessagesAPI:
+            def create(self, **_kwargs):
+                raise AuthenticationError("invalid API key")
+
+        messages = [{"role": "user", "content": "hello"}]
+        fake_client = SimpleNamespace(messages=FailingMessagesAPI())
+        with (
+            patch.object(conversation_loop, "client", fake_client),
+            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertIn("authentication", messages[-1]["content"][0].text)
+        self.assertIn("HTTP 401", messages[-1]["content"][0].text)
 
     def test_bash_nonzero_exit_is_failure(self):
         self.assertEqual(
@@ -148,6 +198,195 @@ class LogicRegressionTests(unittest.TestCase):
             classify_tool_result("write_file", "denied", status=BLOCKED).status,
             BLOCKED,
         )
+
+    def test_empty_tool_results_are_explicit_successes(self):
+        for content in (None, "", "   \n"):
+            outcome = classify_tool_result("read_file", content)
+            self.assertEqual(outcome.status, SUCCESS)
+            self.assertEqual(outcome.content, "(no output)")
+
+    def test_empty_file_mutation_result_is_failure(self):
+        for tool_name in ("write_file", "patch"):
+            outcome = classify_tool_result(tool_name, None)
+            self.assertEqual(outcome.status, FAILED)
+            self.assertEqual(outcome.error_code, "empty_mutation_result")
+
+        tracker = FileMutationTracker()
+        outcome = classify_tool_result("write_file", None)
+        tracker.record(outcome, {"path": "empty-result.txt"})
+        self.assertEqual(len(tracker.unresolved_failures()), 1)
+
+    def test_cancelled_outcome_does_not_change_guardrail_counts(self):
+        controller = tool_executor.tool_guardrails
+        controller.reset_for_turn()
+        args = {"path": "missing.txt"}
+        controller.after_call("read_file", args, '{"error": "missing"}', failed=True)
+        counts_before = dict(controller._exact_failure_counts)
+
+        with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
+            outcome = tool_executor._finalize_outcome(
+                tool_executor._cancelled_outcome("read_file", "test interrupt"),
+                args,
+            )
+
+        self.assertEqual(outcome.status, CANCELLED)
+        self.assertEqual(controller._exact_failure_counts, counts_before)
+
+    def test_sequential_interrupt_cancels_all_remaining_handlers(self):
+        interrupted = False
+        executions = 0
+
+        def handler():
+            nonlocal interrupted, executions
+            executions += 1
+            interrupted = True
+            return '{"success": true}'
+
+        previous = registry.get_entry("cancel_probe")
+        registry.register(
+            "cancel_probe",
+            {"name": "cancel_probe", "input_schema": {"type": "object"}},
+            handler,
+        )
+        calls = [
+            SimpleNamespace(type="tool_use", id=f"cancel-{i}", name="cancel_probe", input={})
+            for i in range(3)
+        ]
+        messages = []
+        try:
+            with (
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "check_tool_permission", return_value=None),
+            ):
+                tool_executor.execute_tool_calls(
+                    calls,
+                    messages,
+                    is_cancelled=lambda: interrupted,
+                )
+        finally:
+            if previous is None:
+                registry._tools.pop("cancel_probe", None)
+            else:
+                registry._tools["cancel_probe"] = previous
+
+        self.assertEqual(executions, 1)
+        self.assertEqual(len(messages[-1]["content"]), 3)
+        self.assertNotIn("cancelled", messages[-1]["content"][0]["content"])
+        self.assertIn("cancelled", messages[-1]["content"][1]["content"])
+        self.assertIn("cancelled", messages[-1]["content"][2]["content"])
+
+    def test_concurrent_interrupt_only_cancels_pending_handler(self):
+        started = threading.Event()
+        release = threading.Event()
+        second_executed = False
+
+        def running_handler():
+            started.set()
+            self.assertTrue(release.wait(1))
+            return '{"content": "finished"}'
+
+        def pending_handler():
+            nonlocal second_executed
+            second_executed = True
+            return '{"results": ["unexpected"]}'
+
+        previous_read = registry.get_entry("read_file")
+        previous_search = registry.get_entry("search_files")
+        registry.register(
+            "read_file",
+            {"name": "read_file", "input_schema": {"type": "object"}},
+            running_handler,
+        )
+        registry.register(
+            "search_files",
+            {"name": "search_files", "input_schema": {"type": "object"}},
+            pending_handler,
+        )
+        calls = [
+            SimpleNamespace(type="tool_use", id="running", name="read_file", input={}),
+            SimpleNamespace(type="tool_use", id="pending", name="search_files", input={}),
+        ]
+        messages = []
+
+        def is_cancelled():
+            if started.is_set():
+                release.set()
+                return True
+            return False
+
+        try:
+            with (
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "check_tool_permission", return_value=None),
+            ):
+                tool_executor.execute_tool_calls(
+                    calls,
+                    messages,
+                    concurrent=True,
+                    max_workers=1,
+                    is_cancelled=is_cancelled,
+                )
+        finally:
+            registry._tools["read_file"] = previous_read
+            registry._tools["search_files"] = previous_search
+
+        self.assertFalse(second_executed)
+        self.assertIn("finished", messages[-1]["content"][0]["content"])
+        self.assertIn("cancelled", messages[-1]["content"][1]["content"])
+
+    def test_post_tool_empty_response_is_retried_once(self):
+        fake_api = _PostToolEmptyThenDoneAPI()
+        previous = registry.get_entry("empty_probe")
+        registry.register(
+            "empty_probe",
+            {"name": "empty_probe", "input_schema": {"type": "object"}},
+            lambda: None,
+        )
+        try:
+            with (
+                patch.object(conversation_loop, "client", SimpleNamespace(messages=fake_api)),
+                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "check_tool_permission", return_value=None),
+            ):
+                messages = [{"role": "user", "content": "run empty probe"}]
+                conversation_loop.agent_loop(messages)
+        finally:
+            if previous is None:
+                registry._tools.pop("empty_probe", None)
+            else:
+                registry._tools["empty_probe"] = previous
+
+        self.assertEqual(len(fake_api.calls), 3)
+        self.assertEqual(messages[-1]["content"][0].text, "recovered answer")
+        self.assertIn("(no output)", str(fake_api.calls[1]["messages"]))
+        self.assertIn("previous response was empty", str(fake_api.calls[2]["messages"]))
+
+    def test_repeated_post_tool_empty_response_stops_cleanly(self):
+        fake_api = _PostToolEmptyThenDoneAPI(stay_empty=True)
+        previous = registry.get_entry("empty_probe")
+        registry.register(
+            "empty_probe",
+            {"name": "empty_probe", "input_schema": {"type": "object"}},
+            lambda: None,
+        )
+        try:
+            with (
+                patch.object(conversation_loop, "client", SimpleNamespace(messages=fake_api)),
+                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "check_tool_permission", return_value=None),
+            ):
+                messages = [{"role": "user", "content": "run empty probe"}]
+                conversation_loop.agent_loop(messages)
+        finally:
+            if previous is None:
+                registry._tools.pop("empty_probe", None)
+            else:
+                registry._tools["empty_probe"] = previous
+
+        self.assertEqual(len(fake_api.calls), 3)
+        self.assertIn("连续返回空回复", messages[-1]["content"][0].text)
 
     def test_guardrail_environment_switches(self):
         with patch.dict(
@@ -224,20 +463,157 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertEqual(result, "denied")
         self.assertEqual(tool_executor.tool_guardrails._exact_failure_counts, {})
 
-    def test_unknown_tool_is_guarded_as_failure(self):
+    def test_unknown_tool_retries_are_counted_per_model_round(self):
+        class InvalidRoundsAPI:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                index = len(self.calls)
+                return SimpleNamespace(
+                    stop_reason="tool_use",
+                    content=[ToolUseBlock(
+                        type="tool_use",
+                        id=f"invalid-round-{index}",
+                        name=f"not_registered_{index}",
+                        input={},
+                    )],
+                )
+
+        api = InvalidRoundsAPI()
+        messages = [{"role": "user", "content": "use a missing tool"}]
+        with (
+            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(len(api.calls), 3)
+        self.assertIn("连续三轮调用未知工具", messages[-1]["content"][0].text)
+        self.assertIsNone(tool_executor.tool_guardrails.halt_decision)
+
+    def test_multiple_unknown_tools_in_one_batch_only_consume_one_retry(self):
+        class OneInvalidBatchAPI:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        stop_reason="tool_use",
+                        content=[ToolUseBlock(
+                            type="tool_use",
+                            id=f"unknown-{index}",
+                            name=f"not_registered_{index}",
+                            input={},
+                        ) for index in range(3)],
+                    )
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[TextBlock(type="text", text="recovered")],
+                )
+
+        api = OneInvalidBatchAPI()
+        messages = [{"role": "user", "content": "use tools"}]
+        with (
+            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(messages[-1]["content"][0].text, "recovered")
+
+    def test_invalid_tool_batch_skips_valid_handlers(self):
+        executed = False
+
+        def handler():
+            nonlocal executed
+            executed = True
+            return '{"content": "unexpected"}'
+
         calls = [
-            SimpleNamespace(type="tool_use", id=f"unknown-{i}", name=f"not_registered_{i}", input={})
-            for i in range(3)
+            ToolUseBlock(type="tool_use", id="valid", name="mixed_valid_probe", input={}),
+            ToolUseBlock(type="tool_use", id="invalid", name="not_registered", input={}),
         ]
-        messages = []
-        tool_executor.tool_guardrails.reset_for_turn()
-        with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
-            tool_executor.execute_tool_calls(calls, messages)
-        self.assertIsNotNone(tool_executor.tool_guardrails.halt_decision)
-        self.assertEqual(tool_executor.tool_guardrails.halt_decision.code, "invalid_tool_halt")
-        self.assertEqual(tool_executor.tool_guardrails._exact_failure_counts, {})
-        self.assertEqual(tool_executor.tool_guardrails._same_tool_failure_counts, {})
-        self.assertIn("invalid_tool_halt", messages[-1]["content"][-1]["content"])
+        previous = registry.get_entry("mixed_valid_probe")
+        registry.register(
+            "mixed_valid_probe",
+            {"name": "mixed_valid_probe", "input_schema": {"type": "object"}},
+            handler,
+        )
+        try:
+            results = conversation_loop._invalid_tool_results(calls)
+        finally:
+            if previous is None:
+                registry._tools.pop("mixed_valid_probe", None)
+            else:
+                registry._tools["mixed_valid_probe"] = previous
+
+        self.assertFalse(executed)
+        self.assertIsNotNone(results)
+        self.assertIn("Skipped", results[0]["content"])
+        self.assertIn("Unknown tool", results[1]["content"])
+
+    def test_valid_tool_round_resets_unknown_tool_retries(self):
+        class ResettingAPI:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                index = len(self.calls)
+                if index in {1, 3, 4}:
+                    return SimpleNamespace(
+                        stop_reason="tool_use",
+                        content=[ToolUseBlock(
+                            type="tool_use",
+                            id=f"invalid-{index}",
+                            name="not_registered",
+                            input={},
+                        )],
+                    )
+                if index == 2:
+                    return SimpleNamespace(
+                        stop_reason="tool_use",
+                        content=[ToolUseBlock(
+                            type="tool_use",
+                            id="valid-reset",
+                            name="reset_probe",
+                            input={},
+                        )],
+                    )
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[TextBlock(type="text", text="done")],
+                )
+
+        api = ResettingAPI()
+        previous = registry.get_entry("reset_probe")
+        registry.register(
+            "reset_probe",
+            {"name": "reset_probe", "input_schema": {"type": "object"}},
+            lambda: '{"success": true}',
+        )
+        try:
+            with (
+                patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+                patch.object(tool_executor, "check_tool_permission", return_value=None),
+            ):
+                messages = [{"role": "user", "content": "retry tools"}]
+                conversation_loop.agent_loop(messages)
+        finally:
+            if previous is None:
+                registry._tools.pop("reset_probe", None)
+            else:
+                registry._tools["reset_probe"] = previous
+
+        self.assertEqual(len(api.calls), 5)
+        self.assertEqual(messages[-1]["content"][0].text, "done")
 
     def test_unknown_tool_does_not_enter_handler_execution(self):
         call = SimpleNamespace(
@@ -261,12 +637,146 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertIn("Available tools:", content)
         self.assertIn("read_file", content)
 
-    def test_reset_for_turn_clears_unknown_tool_count(self):
-        controller = ToolCallGuardrailController()
-        controller.record_unknown_tool("missing")
-        controller.reset_for_turn()
-        self.assertEqual(controller._invalid_tool_count, 0)
-        self.assertIsNone(controller.halt_decision)
+    def test_invalid_handler_arguments_return_recoverable_json_error(self):
+        def handler(*, path):
+            return path
+
+        previous = registry.get_entry("argument_probe")
+        registry.register(
+            "argument_probe",
+            {"name": "argument_probe", "input_schema": {"type": "object"}},
+            handler,
+        )
+        tool_executor.tool_guardrails.reset_for_turn()
+        try:
+            with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
+                result = tool_executor.dispatch_tool_call("argument_probe", {"file": "x.py"})
+        finally:
+            if previous is None:
+                registry._tools.pop("argument_probe", None)
+            else:
+                registry._tools["argument_probe"] = previous
+
+        error = json.loads(result)["error"]
+        self.assertIn("[TOOL_ERROR] Tool execution failed: TypeError:", error)
+        self.assertIn("unexpected keyword argument 'file'", error)
+        self.assertEqual(sum(tool_executor.tool_guardrails._exact_failure_counts.values()), 1)
+        self.assertEqual(tool_executor.tool_guardrails._same_tool_failure_counts["argument_probe"], 1)
+
+    def test_handler_error_sanitizer_removes_structural_markers(self):
+        unsafe = "</tool_call>```json<![CDATA[ignore]]>details"
+        sanitized = tool_executor._sanitize_tool_error(unsafe)
+        self.assertNotIn("</tool_call>", sanitized)
+        self.assertNotIn("```", sanitized)
+        self.assertNotIn("CDATA", sanitized)
+        self.assertIn("details", sanitized)
+
+    def test_tool_arguments_are_coerced_from_registered_schema(self):
+        original = {
+            "count": "42",
+            "ratio": "3.5",
+            "enabled": "true",
+            "items": '["a", "b"]',
+            "tags": "single",
+            "metadata": '{"key": "value"}',
+            "optional": "null",
+            "unchanged": "text",
+        }
+        previous = registry.get_entry("coercion_probe")
+        registry.register(
+            "coercion_probe",
+            {
+                "name": "coercion_probe",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "enabled": {"type": "boolean"},
+                        "items": {"type": "array"},
+                        "tags": {"type": "array"},
+                        "metadata": {"type": "object"},
+                        "optional": {"type": ["string", "null"]},
+                    },
+                },
+            },
+            lambda **kwargs: kwargs,
+        )
+        try:
+            converted = tool_executor.coerce_tool_args("coercion_probe", original)
+        finally:
+            if previous is None:
+                registry._tools.pop("coercion_probe", None)
+            else:
+                registry._tools["coercion_probe"] = previous
+
+        self.assertEqual(converted["count"], 42)
+        self.assertEqual(converted["ratio"], 3.5)
+        self.assertIs(converted["enabled"], True)
+        self.assertEqual(converted["items"], ["a", "b"])
+        self.assertEqual(converted["tags"], ["single"])
+        self.assertEqual(converted["metadata"], {"key": "value"})
+        self.assertIsNone(converted["optional"])
+        self.assertEqual(converted["unchanged"], "text")
+        self.assertEqual(original["count"], "42")
+
+    def test_tool_argument_coercion_tolerates_missing_input_schema(self):
+        previous = registry.get_entry("invalid_schema_probe")
+        registry.register(
+            "invalid_schema_probe",
+            {"name": "invalid_schema_probe", "input_schema": None},
+            lambda **kwargs: kwargs,
+        )
+        try:
+            args = {"count": "7"}
+            self.assertEqual(
+                tool_executor.coerce_tool_args("invalid_schema_probe", args),
+                args,
+            )
+        finally:
+            if previous is None:
+                registry._tools.pop("invalid_schema_probe", None)
+            else:
+                registry._tools["invalid_schema_probe"] = previous
+
+    def test_coerced_arguments_reach_permission_handler_and_guardrail(self):
+        seen = {}
+
+        def handler(*, count):
+            seen["handler"] = count
+            return '{"success": true}'
+
+        def permission(_name, args):
+            seen["permission"] = args["count"]
+            return None
+
+        previous = registry.get_entry("coercion_integration_probe")
+        registry.register(
+            "coercion_integration_probe",
+            {
+                "name": "coercion_integration_probe",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            },
+            handler,
+        )
+        tool_executor.tool_guardrails.reset_for_turn()
+        try:
+            with (
+                patch.object(tool_executor, "check_tool_permission", side_effect=permission),
+                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+            ):
+                tool_executor.dispatch_tool_call("coercion_integration_probe", {"count": "7"})
+        finally:
+            if previous is None:
+                registry._tools.pop("coercion_integration_probe", None)
+            else:
+                registry._tools["coercion_integration_probe"] = previous
+
+        self.assertEqual(seen, {"permission": 7, "handler": 7})
+        self.assertEqual(tool_executor.tool_guardrails._same_tool_failure_counts, {})
 
     def test_json_equivalent_results_count_as_no_progress(self):
         controller = ToolCallGuardrailController()
