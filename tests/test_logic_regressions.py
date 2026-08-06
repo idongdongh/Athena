@@ -2,10 +2,12 @@
 
 import json
 import os
-import subprocess
+import shlex
+import signal
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,8 +39,11 @@ from agent.tool_result_classification import (
 from tools.registry import registry
 from tools.approval import _check_sudo_stdin_guard
 from tools.path_security import check_write_path
+from tools.patch_tool import patch as patch_file
 from tools.read_file_tool import read_file
+import tools.bash_tool as bash_module
 import tools.web_extract_tool as web_extract_module
+import tools.web_search_tool as web_search_module
 
 
 class _FakeTracer:
@@ -68,6 +73,88 @@ class _FakeMessagesAPI:
             stop_reason="end_turn",
             content=[TextBlock(type="text", text="done")],
         )
+
+
+class _FakeMessageStream:
+    def __init__(self, chunks, final_message, *, interrupt_after=None):
+        self.chunks = chunks
+        self.final_message = final_message
+        self.interrupt_after = interrupt_after
+        self.current_message_snapshot = SimpleNamespace(content=[])
+        self.closed = False
+
+    def __iter__(self):
+        text = ""
+        for index, chunk in enumerate(self.chunks, start=1):
+            text += chunk
+            self.current_message_snapshot = SimpleNamespace(
+                content=[TextBlock(type="text", text=text)]
+            )
+            yield SimpleNamespace(
+                type="content_block_delta",
+                delta=SimpleNamespace(type="text_delta", text=chunk),
+            )
+            if self.interrupt_after == index:
+                conversation_loop.interrupt_controller.request()
+
+    def get_final_message(self):
+        return self.final_message
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeStreamManager:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def __enter__(self):
+        return self.stream
+
+    def __exit__(self, *_args):
+        self.stream.close()
+
+
+class _StreamingMessagesAPI:
+    def __init__(self, chunks, final_message, *, interrupt_after=None):
+        self.calls = []
+        self.stream_instance = _FakeMessageStream(
+            chunks,
+            final_message,
+            interrupt_after=interrupt_after,
+        )
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeStreamManager(self.stream_instance)
+
+
+class _BlockingMessageStream:
+    def __init__(self):
+        self.waiting = threading.Event()
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        yield SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text="partial"),
+        )
+        self.waiting.set()
+        self.closed.wait(5)
+
+    def get_final_message(self):
+        raise AssertionError("中断后的流不应读取 final message")
+
+    def close(self):
+        self.closed.set()
+
+
+class _BlockingStreamingMessagesAPI:
+    def __init__(self):
+        self.stream_instance = _BlockingMessageStream()
+
+    def stream(self, **_kwargs):
+        return _FakeStreamManager(self.stream_instance)
 
 
 class _SingleToolBatchAPI:
@@ -139,6 +226,66 @@ class _FakeTavily:
 
 
 class LogicRegressionTests(unittest.TestCase):
+    def tearDown(self):
+        conversation_loop.interrupt_controller.clear()
+        conversation_loop._last_interrupt_time = 0.0
+
+    def test_second_ctrl_c_within_window_requests_force_quit(self):
+        with (
+            patch.object(conversation_loop.time, "monotonic", side_effect=[100.0, 101.0]),
+            patch("builtins.print"),
+        ):
+            conversation_loop._on_interrupt(None, None)
+
+            self.assertTrue(conversation_loop.interrupt_controller.is_requested())
+            with self.assertRaises(KeyboardInterrupt):
+                conversation_loop._on_interrupt(None, None)
+
+    def test_ctrl_c_after_window_rearms_force_quit_window(self):
+        with (
+            patch.object(
+                conversation_loop.time,
+                "monotonic",
+                side_effect=[100.0, 103.0, 104.0],
+            ),
+            patch("builtins.print"),
+        ):
+            conversation_loop._on_interrupt(None, None)
+            conversation_loop._on_interrupt(None, None)
+
+            self.assertEqual(conversation_loop._last_interrupt_time, 103.0)
+            with self.assertRaises(KeyboardInterrupt):
+                conversation_loop._on_interrupt(None, None)
+
+    def test_idle_ctrl_c_clears_existing_input(self):
+        buffer = SimpleNamespace(text="draft", reset=lambda: setattr(buffer, "text", ""))
+        app = SimpleNamespace(
+            current_buffer=buffer,
+            invalidate=lambda: setattr(app, "invalidated", True),
+            exit=lambda **kwargs: setattr(app, "exit_kwargs", kwargs),
+            invalidated=False,
+            exit_kwargs=None,
+        )
+
+        conversation_loop._handle_idle_ctrl_c(SimpleNamespace(app=app))
+
+        self.assertEqual(buffer.text, "")
+        self.assertTrue(app.invalidated)
+        self.assertIsNone(app.exit_kwargs)
+
+    def test_idle_ctrl_c_exits_when_input_is_empty(self):
+        buffer = SimpleNamespace(text="", reset=lambda: None)
+        app = SimpleNamespace(
+            current_buffer=buffer,
+            invalidate=lambda: None,
+            exit=lambda **kwargs: setattr(app, "exit_kwargs", kwargs),
+            exit_kwargs=None,
+        )
+
+        conversation_loop._handle_idle_ctrl_c(SimpleNamespace(app=app))
+
+        self.assertIs(app.exit_kwargs["exception"], KeyboardInterrupt)
+
     def test_anthropic_sdk_retries_are_disabled(self):
         self.assertEqual(conversation_loop.client.max_retries, 0)
 
@@ -155,6 +302,157 @@ class LogicRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(fake_client.messages.calls), 1)
         self.assertEqual(messages[-1]["content"][0].text, "done")
+
+    def test_streaming_emits_text_deltas_and_preserves_final_message(self):
+        final_message = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[TextBlock(type="text", text="hello")],
+        )
+        fake_api = _StreamingMessagesAPI(["hel", "lo"], final_message)
+        emitted = []
+
+        with patch.object(
+            conversation_loop,
+            "client",
+            SimpleNamespace(messages=fake_api),
+        ):
+            response, interrupted = conversation_loop._stream_message_with_recovery(
+                model="test-model",
+                messages=[{"role": "user", "content": "hello"}],
+                system="test",
+                max_tokens=32,
+                timeout=1.0,
+                on_text=emitted.append,
+            )
+
+        self.assertFalse(interrupted)
+        self.assertEqual(emitted, ["hel", "lo", "\n"])
+        self.assertEqual(response.content[0].text, "hello")
+        self.assertNotIn("timeout", fake_api.calls[0])
+        self.assertTrue(fake_api.stream_instance.closed)
+
+    def test_stream_interrupt_keeps_partial_text_without_summary(self):
+        final_message = SimpleNamespace(
+            stop_reason="tool_use",
+            content=[ToolUseBlock(
+                type="tool_use",
+                id="should-not-run",
+                name="bash",
+                input={"command": "mkdir test1"},
+            )],
+        )
+        fake_api = _StreamingMessagesAPI(
+            ["已经生成的", "部分回答"],
+            final_message,
+            interrupt_after=1,
+        )
+        messages = [{"role": "user", "content": "create test1"}]
+
+        with (
+            patch.object(
+                conversation_loop,
+                "client",
+                SimpleNamespace(messages=fake_api),
+            ),
+            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(len(fake_api.calls), 1)
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertEqual(messages[-1]["content"][0].text, "已经生成的")
+        self.assertNotIn("tool_use", str(messages[-1]))
+        self.assertTrue(fake_api.stream_instance.closed)
+
+    def test_stream_interrupt_actively_closes_blocked_stream(self):
+        fake_api = _BlockingStreamingMessagesAPI()
+        emitted = []
+
+        def request_interrupt():
+            self.assertTrue(fake_api.stream_instance.waiting.wait(1))
+            conversation_loop.interrupt_controller.request()
+
+        interrupter = threading.Thread(target=request_interrupt)
+        interrupter.start()
+        started_at = time.monotonic()
+        try:
+            with patch.object(
+                conversation_loop,
+                "client",
+                SimpleNamespace(messages=fake_api),
+            ):
+                response, interrupted = conversation_loop._stream_message_with_recovery(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    system="test",
+                    max_tokens=32,
+                    timeout=1.0,
+                    on_text=emitted.append,
+                )
+        finally:
+            interrupter.join(1)
+
+        self.assertTrue(interrupted)
+        self.assertEqual(response.content[0].text, "partial")
+        self.assertEqual(emitted, ["partial"])
+        self.assertTrue(fake_api.stream_instance.closed.is_set())
+        self.assertLess(time.monotonic() - started_at, 1.5)
+
+    def test_stream_close_does_not_wait_for_blocked_enter(self):
+        entered = threading.Event()
+        release_enter = threading.Event()
+
+        class BlockingEnterManager:
+            def __enter__(self):
+                entered.set()
+                release_enter.wait(1)
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_message(self):
+                return SimpleNamespace(stop_reason="end_turn", content=[])
+
+            def close(self):
+                pass
+
+        worker = conversation_loop._StreamWorker(
+            lambda **_kwargs: BlockingEnterManager(),
+            {},
+            None,
+            None,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(0.5))
+
+        closer = threading.Thread(target=worker.close_active)
+        closer.start()
+        closer.join(0.2)
+        try:
+            self.assertFalse(
+                closer.is_alive(),
+                "close_active 不应等待阻塞在 Provider __enter__ 中的 worker",
+            )
+        finally:
+            release_enter.set()
+            closer.join(1)
+            worker.drain(1)
+
+    def test_emit_assistant_message_prints_controlled_text(self):
+        messages = []
+        with patch("builtins.print") as print_mock:
+            conversation_loop._emit_assistant_message(
+                messages,
+                "[controlled stop]",
+                stream_output=True,
+            )
+
+        print_mock.assert_called_once_with("[controlled stop]")
+        self.assertEqual(messages[-1]["content"][0].text, "[controlled stop]")
 
     def test_permanent_provider_error_returns_controlled_assistant_message(self):
         class AuthenticationError(Exception):
@@ -187,6 +485,57 @@ class LogicRegressionTests(unittest.TestCase):
             (False, ""),
         )
 
+    def test_interrupt_terminates_running_bash_process_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = Path(tmp) / "child.pid"
+            child_code = (
+                "import os, pathlib, time; "
+                f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                "time.sleep(30)"
+            )
+            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}"
+            result = {}
+
+            def execute_bash():
+                result["raw"] = tool_executor._execute_raw_tool_call(
+                    "bash",
+                    {"command": command, "timeout": 30},
+                )
+
+            worker = threading.Thread(target=execute_bash)
+            worker.start()
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not pid_path.exists():
+                    time.sleep(0.02)
+                self.assertTrue(pid_path.exists(), "bash child did not start")
+                child_pid = int(pid_path.read_text())
+
+                conversation_loop.interrupt_controller.request()
+                worker.join(3)
+
+                self.assertFalse(worker.is_alive(), "bash did not stop after interrupt")
+                self.assertEqual(result["raw"].status, CANCELLED)
+
+                process_deadline = time.monotonic() + 1
+                while time.monotonic() < process_deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("bash child process survived process-group termination")
+            finally:
+                conversation_loop.interrupt_controller.request()
+                worker.join(2)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_outcome_classifies_execution_and_policy_states(self):
         self.assertEqual(classify_tool_result("bash", '{"exit_code": 2}').status, FAILED)
         self.assertEqual(classify_tool_result("read_file", '{"content": "ok"}').status, SUCCESS)
@@ -198,6 +547,29 @@ class LogicRegressionTests(unittest.TestCase):
             classify_tool_result("write_file", "denied", status=BLOCKED).status,
             BLOCKED,
         )
+
+    def test_structured_success_ignores_nonfatal_error_fields(self):
+        nullable_error = classify_tool_result(
+            "web_extract",
+            '{"success": true, "error": null, "data": "ok"}',
+        )
+        partial_failure = classify_tool_result(
+            "web_extract",
+            (
+                '{"success": true, "results": ['
+                '{"url": "a", "content": "ok"}, '
+                '{"url": "b", "error": "timeout"}]}'
+            ),
+        )
+        explicit_failure = classify_tool_result(
+            "web_extract",
+            '{"success": false, "error": "request failed"}',
+        )
+
+        self.assertEqual(nullable_error.status, SUCCESS)
+        self.assertEqual(partial_failure.status, SUCCESS)
+        self.assertEqual(explicit_failure.status, FAILED)
+        self.assertEqual(explicit_failure.error_message, "request failed")
 
     def test_empty_tool_results_are_explicit_successes(self):
         for content in (None, "", "   \n"):
@@ -387,41 +759,6 @@ class LogicRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(fake_api.calls), 3)
         self.assertIn("连续返回空回复", messages[-1]["content"][0].text)
-
-    def test_guardrail_environment_switches(self):
-        with patch.dict(
-            os.environ,
-            {"TOOL_GUARDRAIL_WARNINGS": "off", "TOOL_GUARDRAIL_HARD_STOP": "false"},
-        ):
-            config = ToolCallGuardrailConfig.from_environment()
-        self.assertFalse(config.warnings_enabled)
-        self.assertFalse(config.hard_stop_enabled)
-
-    def test_dotenv_guardrail_switch_is_loaded_before_executor_import(self):
-        with tempfile.TemporaryDirectory() as task_tmp:
-            Path(task_tmp, ".env").write_text(
-                "ANTHROPIC_API_KEY=test-key\n"
-                "MODEL_ID=test-model\n"
-                "TOOL_GUARDRAIL_HARD_STOP=false\n",
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env.pop("TOOL_GUARDRAIL_HARD_STOP", None)
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "from agent.conversation_loop import tool_guardrails; "
-                    "print(tool_guardrails.config.hard_stop_enabled)",
-                ],
-                cwd=task_tmp,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        self.assertEqual(result.stdout.strip(), "False")
 
     def test_permission_block_does_not_increment_guardrail(self):
         call = SimpleNamespace(type="tool_use", id="blocked-1", name="read_file", input={"path": "x.py"})
@@ -663,6 +1000,32 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertEqual(sum(tool_executor.tool_guardrails._exact_failure_counts.values()), 1)
         self.assertEqual(tool_executor.tool_guardrails._same_tool_failure_counts["argument_probe"], 1)
 
+    def test_invalid_permission_argument_returns_outcome_instead_of_raising(self):
+        outcome = tool_executor._preflight_call(
+            "bash",
+            {"command": {"unexpected": "object"}},
+        )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, INTERNAL_ERROR)
+        self.assertEqual(outcome.error_code, "invalid_arguments")
+        self.assertIn("Invalid arguments for bash", outcome.content)
+
+    def test_non_mapping_tool_input_returns_protocol_complete_error(self):
+        call = SimpleNamespace(
+            type="tool_use",
+            id="bad-input",
+            name="bash",
+            input=["not", "an", "object"],
+        )
+        messages = []
+
+        with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
+            tool_executor.execute_tool_calls([call], messages)
+
+        self.assertEqual(messages[-1]["content"][0]["tool_use_id"], "bad-input")
+        self.assertIn("tool input must be a JSON object", messages[-1]["content"][0]["content"])
+
     def test_handler_error_sanitizer_removes_structural_markers(self):
         unsafe = "</tool_call>```json<![CDATA[ignore]]>details"
         sanitized = tool_executor._sanitize_tool_error(unsafe)
@@ -670,6 +1033,120 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertNotIn("```", sanitized)
         self.assertNotIn("CDATA", sanitized)
         self.assertIn("details", sanitized)
+
+    def test_patch_rejects_non_utf8_without_changing_original_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.txt"
+            original = b"prefix\xfftarget\n"
+            path.write_bytes(original)
+
+            result = json.loads(patch_file(str(path), "target", "changed"))
+
+            self.assertIn("not valid UTF-8", result["error"])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_patch_preserves_crlf_newlines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "windows.txt"
+            path.write_bytes(b"first\r\nold\r\nlast\r\n")
+
+            result = json.loads(patch_file(str(path), "old", "new"))
+
+            self.assertTrue(result["success"])
+            self.assertEqual(path.read_bytes(), b"first\r\nnew\r\nlast\r\n")
+
+    def test_read_file_streams_without_path_read_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large.txt"
+            path.write_bytes((b"skip\n" * 20_000) + b"target\n")
+
+            with patch.object(Path, "read_text", side_effect=AssertionError("full read")):
+                result = json.loads(read_file(str(path), offset=20_001, limit=1))
+
+            self.assertEqual(result["content"], "20001|target")
+            self.assertEqual(result["total_lines"], 20_001)
+
+    def test_read_file_rejects_huge_single_line_with_bounded_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "huge-line.txt"
+            path.write_bytes(b"x" * (500_000))
+
+            result = json.loads(read_file(str(path), limit=1))
+
+            self.assertIn("safety limit", result["error"])
+
+    def test_bash_large_output_is_capped_after_disk_spooling(self):
+        command = (
+            f"{shlex.quote(sys.executable)} -c "
+            f"{shlex.quote('import sys; sys.stdout.write(\"x\" * 200000); '
+                          'sys.stderr.write(\"y\" * 200000)')}"
+        )
+
+        result = json.loads(bash_module.bash(command, timeout=5))
+
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["stdout"]), bash_module.MAX_OUTPUT_CHARS)
+        self.assertLessEqual(len(result["stderr"]), bash_module.MAX_OUTPUT_CHARS)
+        self.assertIn("bytes total", result["stdout"])
+
+    def test_running_web_tools_return_cancelled_without_waiting_for_timeout(self):
+        cases = [
+            (
+                "web_search",
+                web_search_module,
+                {"query": "hello"},
+            ),
+            (
+                "web_extract",
+                web_extract_module,
+                {"urls": ["https://example.test"]},
+            ),
+        ]
+
+        for tool_name, module, args in cases:
+            with self.subTest(tool_name=tool_name):
+                started = threading.Event()
+                released = threading.Event()
+                closed = threading.Event()
+
+                class BlockingTavily:
+                    def __init__(self, **_kwargs):
+                        pass
+
+                    def search(self, *_args, **_kwargs):
+                        started.set()
+                        released.wait(5)
+                        return {"results": []}
+
+                    def extract(self, *_args, **_kwargs):
+                        started.set()
+                        released.wait(5)
+                        return {"results": [], "failed_results": [], "failed_urls": []}
+
+                    def close(self):
+                        closed.set()
+                        released.set()
+
+                result = {}
+                with patch.object(module, "TavilyClient", BlockingTavily):
+                    worker = threading.Thread(
+                        target=lambda: result.setdefault(
+                            "raw",
+                            tool_executor._execute_raw_tool_call(tool_name, args),
+                        )
+                    )
+                    worker.start()
+                    self.assertTrue(started.wait(1))
+                    started_at = time.monotonic()
+                    conversation_loop.interrupt_controller.request()
+                    worker.join(1)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(result["raw"].status, CANCELLED)
+                self.assertTrue(closed.is_set())
+                self.assertLess(time.monotonic() - started_at, 0.5)
+                conversation_loop.interrupt_controller.clear()
 
     def test_tool_arguments_are_coerced_from_registered_schema(self):
         original = {
@@ -680,6 +1157,9 @@ class LogicRegressionTests(unittest.TestCase):
             "tags": "single",
             "metadata": '{"key": "value"}',
             "optional": "null",
+            "string_or_integer": "123",
+            "any_of_integer": "7",
+            "any_of_string_or_integer": "456",
             "unchanged": "text",
         }
         previous = registry.get_entry("coercion_probe")
@@ -697,6 +1177,13 @@ class LogicRegressionTests(unittest.TestCase):
                         "tags": {"type": "array"},
                         "metadata": {"type": "object"},
                         "optional": {"type": ["string", "null"]},
+                        "string_or_integer": {"type": ["string", "integer"]},
+                        "any_of_integer": {
+                            "anyOf": [{"type": "integer"}, {"type": "null"}],
+                        },
+                        "any_of_string_or_integer": {
+                            "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        },
                     },
                 },
             },
@@ -717,6 +1204,9 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertEqual(converted["tags"], ["single"])
         self.assertEqual(converted["metadata"], {"key": "value"})
         self.assertIsNone(converted["optional"])
+        self.assertEqual(converted["string_or_integer"], "123")
+        self.assertEqual(converted["any_of_integer"], 7)
+        self.assertEqual(converted["any_of_string_or_integer"], "456")
         self.assertEqual(converted["unchanged"], "text")
         self.assertEqual(original["count"], "42")
 

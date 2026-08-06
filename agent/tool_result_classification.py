@@ -35,7 +35,7 @@ class ToolOutcome:
     tool_name: str
     # 工具返回给模型的原始内容。
     content: str
-    # 工具调用的状态，例如 successed、failed、blocked。
+    # 工具调用的状态，例如 succeeded、failed、blocked。
     status: str
     # 机器可读的错误码；没有错误时为 None。
     error_code: str | None = None
@@ -130,11 +130,29 @@ def classify_tool_result(
         return ToolOutcome(tool_name, text, SUCCESS)
 
     if isinstance(data, dict):
-        error = data.get("error") or data.get("message")
-        if error and (data.get("success") is False or "error" in data):
-            return ToolOutcome(tool_name, text, FAILED, "structured_error", str(error))
+        # 结构化字段是权威信号。不能继续扫描整段 JSON 文本，否则
+        # success=true + error=null，或结果列表中的局部 error，都会被误判为失败。
+        error = data.get("error")
         if data.get("success") is False:
-            return ToolOutcome(tool_name, text, FAILED, "unsuccessful_result", "success=false")
+            message = error or data.get("message") or "success=false"
+            return ToolOutcome(
+                tool_name,
+                text,
+                FAILED,
+                "unsuccessful_result",
+                str(message),
+            )
+        if error:
+            return ToolOutcome(tool_name, text, FAILED, "structured_error", str(error))
+        if data.get("failed") is True:
+            message = data.get("message") or "failed=true"
+            return ToolOutcome(tool_name, text, FAILED, "structured_error", str(message))
+        return ToolOutcome(tool_name, text, SUCCESS)
+
+    # 其他合法 JSON（例如数组或标量）同样属于结构化结果。只有无法解析的普通
+    # 文本才使用错误关键词兜底，避免嵌套数据中的 error 字段污染调用级状态。
+    if data is not None:
+        return ToolOutcome(tool_name, text, SUCCESS)
 
     lower = text[:500].lower()
     if text.startswith("Error") or '"error"' in lower or '"failed"' in lower:

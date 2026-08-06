@@ -11,6 +11,7 @@ import os
 import json
 
 from tavily import TavilyClient
+from agent.interrupt_controller import ToolExecutionCancelled, run_interruptible
 
 # 如果当脚本被直接执行，sys.pathp[0]=xx/tools，然后在这个目录下面找tools.registry，会找不到
 try:
@@ -57,13 +58,23 @@ def web_search(query: str, limit: int = 5) -> str:
         limit = 5
     limit = min(max(limit, 1), 20)
 
+    client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+    close_client = getattr(client, "close", lambda: None)
     try:
-        client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-        raw = client.search(query, max_results=limit)["results"]
+        response = run_interruptible(
+            lambda: client.search(query, max_results=limit, timeout=30),
+            on_cancel=close_client,
+            thread_name="web-search-request",
+        )
+        raw = response["results"]
+    except ToolExecutionCancelled:
+        raise
     # 有异常则执行，Exception 是 python 内置异常基类包括很多异常
-    except Exception as exc:  
+    except Exception as exc:
         # ensure_ascii=False：所有非 ascii 字符不转义
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+    finally:
+        close_client()
 
     web = [
         {

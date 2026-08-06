@@ -32,7 +32,20 @@ def patch(path: str, old_string: str, new_string: str, replace_all: bool = False
         return json.dumps({"error": "old_string must not be empty"}, ensure_ascii=False)
 
     try:
-        original = fp.read_text(encoding="utf-8", errors="replace")
+        # patch 是写操作，不能像只读预览那样用 errors="replace"。替换字符再
+        # 覆盖会永久破坏无法解码的原始字节；非 UTF-8 文件必须明确拒绝。
+        with fp.open("r", encoding="utf-8", errors="strict", newline="") as source:
+            original = source.read()
+    except UnicodeDecodeError as e:
+        return json.dumps(
+            {
+                "error": (
+                    f"File is not valid UTF-8; refusing to patch without changing its "
+                    f"encoding: {path} ({e})"
+                )
+            },
+            ensure_ascii=False,
+        )
     except Exception as e:
         return json.dumps({"error": f"Failed to read file: {e}"}, ensure_ascii=False)
 
@@ -64,7 +77,9 @@ def patch(path: str, old_string: str, new_string: str, replace_all: bool = False
     ))
 
     try:
-        fp.write_text(new_text, encoding="utf-8")
+        # newline="" 禁止 universal-newline 转换，原文件的 CRLF/LF 保持不变。
+        with fp.open("w", encoding="utf-8", newline="") as target:
+            target.write(new_text)
     except Exception as e:
         return json.dumps({"error": f"Failed to write file: {e}"}, ensure_ascii=False)
 

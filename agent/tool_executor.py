@@ -11,11 +11,13 @@ import logging
 import math
 import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Callable, List
 
 from agent.file_mutation_tracker import FileMutationTracker
 from agent.config_loader import load_config
+from agent.interrupt_controller import ToolExecutionCancelled
 from agent.tool_guardrails import (
     IDEMPOTENT_TOOL_NAMES,
     ToolCallGuardrailConfig,
@@ -42,7 +44,7 @@ _project_config = load_config()
 tool_guardrails = ToolCallGuardrailController(
     ToolCallGuardrailConfig.from_mapping(
         _project_config.get("tool_loop_guardrails")
-    ).with_environment_overrides()
+    )
 )
 file_mutation_tracker = FileMutationTracker()
 
@@ -92,14 +94,45 @@ def _schema_allows_null(schema: dict) -> bool:
     return False
 
 
+def _union_schema_types(schema: dict) -> list[str]:
+    """提取 anyOf/oneOf 中声明的简单 JSON Schema 类型。"""
+    candidates: list[str] = []
+    for key in ("anyOf", "oneOf"):
+        options = schema.get(key)
+        if not isinstance(options, list):
+            continue
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            option_type = option.get("type")
+            if isinstance(option_type, str):
+                candidates.append(option_type)
+            elif isinstance(option_type, list):
+                candidates.extend(item for item in option_type if isinstance(item, str))
+    return list(dict.fromkeys(candidates))
+
+
 def _coerce_tool_value(value: str, expected_type: Any, schema: dict) -> Any:
     """按单个字段的 schema 安全转换字符串；无法确定时保留原值。"""
     if _schema_allows_null(schema) and value.strip().lower() == "null":
         return None
 
+    union_types: list[str] = []
     if isinstance(expected_type, list):
-        for candidate in expected_type:
-            converted = _coerce_tool_value(value, candidate, schema)
+        union_types = [item for item in expected_type if isinstance(item, str)]
+    elif expected_type is None:
+        union_types = _union_schema_types(schema)
+
+    if union_types:
+        # 字符串原值已经满足联合类型中的 string，不应再被机会式地转换成数字、
+        # 布尔值等其他合法类型。显式字符串 "null" 的转换已在上方单独处理。
+        if "string" in union_types:
+            return value
+        for candidate in union_types:
+            if candidate == "null":
+                continue
+            # 传空 schema，避免递归时再次展开同一个 anyOf/oneOf。
+            converted = _coerce_tool_value(value, candidate, {})
             if converted is not value:
                 return converted
         return value
@@ -136,6 +169,8 @@ def _coerce_tool_value(value: str, expected_type: Any, schema: dict) -> Any:
 
 def coerce_tool_args(tool_name: str, args: dict) -> dict:
     """根据注册工具的 input_schema 安全转换参数类型，不修改原始参数。"""
+    if not isinstance(args, Mapping):
+        raise TypeError("tool input must be a JSON object")
     converted_args = dict(args)
     entry = registry.get_entry(tool_name)
     if entry is None:
@@ -146,6 +181,12 @@ def coerce_tool_args(tool_name: str, args: dict) -> dict:
     properties = input_schema.get("properties", {})
     if not isinstance(properties, dict):
         return converted_args
+
+    required = input_schema.get("required", [])
+    if isinstance(required, list):
+        missing = [key for key in required if key not in converted_args]
+        if missing:
+            raise ValueError(f"missing required argument(s): {', '.join(missing)}")
 
     for key, value in list(converted_args.items()):
         schema = properties.get(key)
@@ -158,10 +199,57 @@ def coerce_tool_args(tool_name: str, args: dict) -> dict:
                 converted_args[key] = [value] if converted is value else converted
             else:
                 converted_args[key] = [value]
+            if not _value_matches_schema_type(converted_args[key], schema):
+                raise TypeError(
+                    f"argument '{key}' has invalid type "
+                    f"{type(converted_args[key]).__name__}; expected array"
+                )
             continue
         if isinstance(value, str):
             converted_args[key] = _coerce_tool_value(value, expected_type, schema)
+
+        value = converted_args[key]
+        if not _value_matches_schema_type(value, schema):
+            raise TypeError(
+                f"argument '{key}' has invalid type {type(value).__name__}; "
+                f"expected {schema.get('type') or 'declared schema'}"
+            )
+        enum = schema.get("enum")
+        if isinstance(enum, list) and value not in enum:
+            raise ValueError(f"argument '{key}' must be one of {enum}")
     return converted_args
+
+
+def _value_matches_schema_type(value: Any, schema: dict) -> bool:
+    """值是否满足工具 schema 声明的基础 JSON 类型。"""
+    if value is None:
+        return _schema_allows_null(schema)
+
+    expected = schema.get("type")
+    candidates = expected if isinstance(expected, list) else [expected]
+    if expected is None:
+        candidates = _union_schema_types(schema)
+    if not candidates:
+        return True
+
+    python_types = {
+        "string": str,
+        "integer": int,
+        "number": (int, float),
+        "boolean": bool,
+        "array": (list, tuple),
+        "object": Mapping,
+        "null": type(None),
+    }
+    for candidate in candidates:
+        expected_python = python_types.get(candidate)
+        if expected_python is None:
+            continue
+        if candidate in {"integer", "number"} and isinstance(value, bool):
+            continue
+        if isinstance(value, expected_python):
+            return True
+    return False
 
 
 def _execute_raw_tool_call(name: str, args: dict) -> RawToolExecution:
@@ -171,6 +259,11 @@ def _execute_raw_tool_call(name: str, args: dict) -> RawToolExecution:
         return RawToolExecution(f"Unknown tool: {name}", UNKNOWN)
     try:
         output = entry.handler(**args)
+    except ToolExecutionCancelled as exc:
+        return RawToolExecution(
+            f"[Tool execution cancelled: {exc}]",
+            CANCELLED,
+        )
     except Exception as exc:
         logger.exception("Tool %s execution failed", name)
         error = _sanitize_tool_error(
@@ -194,7 +287,11 @@ def dispatch_tool_call(name: str, args: dict) -> str:
     与批量路径使用同一契约：记录调用、执行 preflight、更新
     guardrail / 文件状态 / trace，防止兼容调用方绕过权限边界。
     """
-    args = coerce_tool_args(name, args)
+    try:
+        args = coerce_tool_args(name, args)
+    except (TypeError, ValueError, OverflowError) as exc:
+        outcome = _invalid_arguments_outcome(name, exc)
+        return _finalize_outcome(outcome, {}).content
     get_tracer().tool_call(name, args)
     outcome = _preflight_call(name, args)
     if outcome is None:
@@ -216,6 +313,30 @@ def _cancelled_outcome(name: str, reason: str) -> ToolOutcome:
     )
 
 
+def _invalid_arguments_outcome(name: str, exc: Exception) -> ToolOutcome:
+    """把模型生成的非法参数转换为可恢复结果，不让异常逃出工具循环。"""
+    message = f"Invalid arguments for {name}: {_sanitize_tool_error(str(exc))}"
+    return ToolOutcome(
+        name,
+        message,
+        INTERNAL_ERROR,
+        "invalid_arguments",
+        message,
+    )
+
+
+def _preflight_error_outcome(name: str, exc: Exception) -> ToolOutcome:
+    """权限或护栏预检自身异常时返回稳定的内部错误。"""
+    message = f"Tool preflight failed for {name}: {_sanitize_tool_error(str(exc))}"
+    return ToolOutcome(
+        name,
+        message,
+        INTERNAL_ERROR,
+        "preflight_exception",
+        message,
+    )
+
+
 def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
     """调用前预检。
 
@@ -231,27 +352,33 @@ def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
         ToolOutcome
         None 允许调用
     """
-    decision = tool_guardrails.before_call(name, args)
-    if not decision.allows_execution:
-        content = toolguard_synthetic_result(decision)
-        print(f"\033[33m⚠️  guardrail block: {decision.message}\033[0m")
-        return _blocked_outcome(name, content, decision.code)
+    try:
+        decision = tool_guardrails.before_call(name, args)
+        if not decision.allows_execution:
+            content = toolguard_synthetic_result(decision)
+            print(f"\033[33m⚠️  guardrail block: {decision.message}\033[0m")
+            return _blocked_outcome(name, content, decision.code)
 
-    # conversation loop 会按模型轮次处理未知工具；这里保留兜底，确保兼容入口
-    # 或注册表变化时仍不执行 handler，并返回可恢复的明确错误。
-    if registry.get_entry(name) is None:
-        available_tools = ", ".join(registry.names()) or "(none)"
-        return classify_tool_result(
-            name,
-            f"Unknown tool: {name}. Available tools: {available_tools}",
-            status=UNKNOWN,
-        )
+        # conversation loop 会按模型轮次处理未知工具；这里保留兜底，确保兼容入口
+        # 或注册表变化时仍不执行 handler，并返回可恢复的明确错误。
+        if registry.get_entry(name) is None:
+            available_tools = ", ".join(registry.names()) or "(none)"
+            return classify_tool_result(
+                name,
+                f"Unknown tool: {name}. Available tools: {available_tools}",
+                status=UNKNOWN,
+            )
 
-    blocked_message = check_tool_permission(name, args)
-    if blocked_message is not None:
-        # 策略拒绝没有执行 handler，不可污染失败计数。
-        return _blocked_outcome(name, blocked_message, "permission_denied")
-    return None
+        blocked_message = check_tool_permission(name, args)
+        if blocked_message is not None:
+            # 策略拒绝没有执行 handler，不可污染失败计数。
+            return _blocked_outcome(name, blocked_message, "permission_denied")
+        return None
+    except (TypeError, ValueError, AttributeError, OverflowError) as exc:
+        return _invalid_arguments_outcome(name, exc)
+    except Exception as exc:
+        logger.exception("Tool %s preflight failed", name)
+        return _preflight_error_outcome(name, exc)
 
 
 def _finalize_outcome(outcome: ToolOutcome, args: dict) -> ToolOutcome:
@@ -320,6 +447,131 @@ def _should_parallelize_tool_batch(calls: list[Any]) -> bool:
     )
 
 
+def _prepare_args(calls) -> tuple[list[dict], list[ToolOutcome | None]]:
+    """参数校验 + coerce；返回 (prepared_args, preparation_errors)。
+
+    与原 ``execute_tool_calls`` 顶部的 prepare 循环等价；抽出来便于顺序 / 并发路径共享。
+    """
+    prepared_args: list[dict] = []
+    preparation_errors: list[ToolOutcome | None] = []
+    for call in calls:
+        try:
+            prepared_args.append(coerce_tool_args(call.name, call.input))
+            preparation_errors.append(None)
+        except (TypeError, ValueError, OverflowError) as exc:
+            prepared_args.append({})
+            preparation_errors.append(_invalid_arguments_outcome(call.name, exc))
+    return prepared_args, preparation_errors
+
+
+def _run_one_or_cancelled(call, args, preparation_error, is_cancelled) -> ToolOutcome:
+    """单步顺序执行：preflight → execute → 分类（不 finalize，由调用方统一做）。
+
+    只有顺序路径使用这条流水线——并发路径要求 preflight 全部先完成、handler 并发跑。
+    """
+    if is_cancelled():
+        return _cancelled_outcome(call.name, "not started due to user interrupt")
+    if preparation_error is not None:
+        return preparation_error
+    preflight = _preflight_call(call.name, args)
+    if preflight is None:
+        return _classify_raw_execution(call.name, _execute_raw_tool_call(call.name, args))
+    return preflight
+
+
+def _run_sequential(
+    calls,
+    prepared_args: list[dict],
+    preparation_errors: list[ToolOutcome | None],
+    is_cancelled: Callable[[], bool],
+) -> list[ToolOutcome]:
+    """逐个 preflight → execute → finalize。
+
+    顺序执行必须让第 N 次重复调用在同批次内也看到前 N-1 次的失败计数，
+    guardrail 状态机依赖这一点。
+    """
+    outcomes: list[ToolOutcome] = []
+    for call, args, prep_err in zip(calls, prepared_args, preparation_errors):
+        get_tracer().tool_call(call.name, args)
+        outcome = _run_one_or_cancelled(call, args, prep_err, is_cancelled)
+        outcomes.append(_finalize_outcome(outcome, args))
+    return outcomes
+
+
+def _run_parallel(
+    calls,
+    prepared_args: list[dict],
+    preparation_errors: list[ToolOutcome | None],
+    is_cancelled: Callable[[], bool],
+    max_workers: int,
+) -> list[ToolOutcome]:
+    """并发执行：批量 preflight 后用 ThreadPoolExecutor 跑 handler，最后主线程顺序 finalize。
+
+    所有 stateful 操作（guardrail、file_mutation_tracker、trace）都在主线程按模型原
+    始调用顺序归并——worker 只跑 handler，不触碰共享状态。
+    """
+    raw_outcomes: list[RawToolExecution | ToolOutcome | None] = [None] * len(calls)
+    executable: list[tuple[int, Any, dict]] = []
+    for index, (call, args, prep_err) in enumerate(
+        zip(calls, prepared_args, preparation_errors)
+    ):
+        get_tracer().tool_call(call.name, args)
+        if is_cancelled():
+            raw_outcomes[index] = _cancelled_outcome(
+                call.name, "not started due to user interrupt"
+            )
+            continue
+        if prep_err is not None:
+            raw_outcomes[index] = prep_err
+            continue
+        preflight = _preflight_call(call.name, args)
+        if preflight is None:
+            executable.append((index, call, args))
+        else:
+            raw_outcomes[index] = preflight
+
+    if executable:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(executable))) as executor:
+            futures = {
+                executor.submit(_execute_raw_tool_call, call.name, args): index
+                for index, call, args in executable
+            }
+            pending = set(futures)
+            while pending:
+                if is_cancelled():
+                    for future in list(pending):
+                        if future.cancel():
+                            index = futures[future]
+                            raw_outcomes[index] = _cancelled_outcome(
+                                calls[index].name, "not started due to user interrupt"
+                            )
+                            pending.remove(future)
+                if not pending:
+                    break
+                completed, pending = wait(
+                    pending, timeout=0.1, return_when=FIRST_COMPLETED
+                )
+                for future in completed:
+                    raw_outcomes[futures[future]] = future.result()
+
+    # 主线程顺序归并：worker 已隔离 handler 异常；这里仍保留兜底，确保每个 tool_use
+    # 必有一个对应 tool_result，不会破坏 API 协议。
+    outcomes: list[ToolOutcome] = []
+    for call, args, raw_or_outcome in zip(calls, prepared_args, raw_outcomes):
+        if raw_or_outcome is None:
+            outcome = classify_tool_result(
+                call.name,
+                "Error: worker did not return a result",
+                status=INTERNAL_ERROR,
+            )
+        elif isinstance(raw_or_outcome, RawToolExecution):
+            outcome = _classify_raw_execution(call.name, raw_or_outcome)
+        else:
+            outcome = raw_or_outcome
+        outcomes.append(_finalize_outcome(outcome, args))
+    return outcomes
+
+
 def execute_tool_calls(
     blocks: List[Any],
     messages: List[Any],
@@ -336,88 +588,21 @@ def execute_tool_calls(
     for call in calls:
         print(f"use_tool:\033[33m{call.name}\033[0m\n")
 
-    prepared_args = [coerce_tool_args(call.name, call.input) for call in calls]
+    prepared_args, preparation_errors = _prepare_args(calls)
 
-    # 顺序执行路径必须逐个 preflight（预检） → 执行 → 归并，才能让第 N 次重复调用在
-    # 同一批次内也看到前 N-1 次的失败计数。
-    if not concurrent or not _should_parallelize_tool_batch(calls):
-        outcomes: list[ToolOutcome] = []
-        for call, args in zip(calls, prepared_args):
-            get_tracer().tool_call(call.name, args)
-            if is_cancelled():
-                outcome = _cancelled_outcome(
-                    call.name,
-                    "not started due to user interrupt",
-                )
-            else:
-                outcome = _preflight_call(call.name, args)
-                if outcome is None:
-                    outcome = _classify_raw_execution(
-                        call.name,
-                        _execute_raw_tool_call(call.name, args),
-                    )
-            outcomes.append(_finalize_outcome(outcome, args))
+    # 顺序执行路径必须逐个 preflight → execute → finalize，让第 N 次重复调用在
+    # 同一批次内也看到前 N-1 次的失败计数（guardrail 状态机依赖这一点）。
+    # 并发路径只对"工具名互不重复 + 全是只读工具"的批次启用。
+    parallel = concurrent and _should_parallelize_tool_batch(calls)
+    if parallel:
+        outcomes = _run_parallel(
+            calls, prepared_args, preparation_errors, is_cancelled, max_workers,
+        )
     else:
-        # 并发执行路径在启动 worker 前完成所有 preflight；worker 仅执行 handler。
-        raw_outcomes: list[RawToolExecution | ToolOutcome | None] = [None] * len(calls)
-        executable: list[tuple[int, Any, dict]] = []
-        for index, (call, args) in enumerate(zip(calls, prepared_args)):
-            get_tracer().tool_call(call.name, args)
-            if is_cancelled():
-                raw_outcomes[index] = _cancelled_outcome(
-                    call.name,
-                    "not started due to user interrupt",
-                )
-                continue
-            preflight = _preflight_call(call.name, args)
-            if preflight is None:
-                executable.append((index, call, args))
-            else:
-                raw_outcomes[index] = preflight
+        outcomes = _run_sequential(
+            calls, prepared_args, preparation_errors, is_cancelled,
+        )
 
-        if executable:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(executable))) as executor:
-                futures = {
-                    executor.submit(_execute_raw_tool_call, call.name, args): index
-                    for index, call, args in executable
-                }
-                pending = set(futures)
-                while pending:
-                    if is_cancelled():
-                        for future in list(pending):
-                            if future.cancel():
-                                index = futures[future]
-                                raw_outcomes[index] = _cancelled_outcome(
-                                    calls[index].name,
-                                    "not started due to user interrupt",
-                                )
-                                pending.remove(future)
-                    if not pending:
-                        break
-                    completed, pending = wait(
-                        pending,
-                        timeout=0.1,
-                        return_when=FIRST_COMPLETED,
-                    )
-                    for future in completed:
-                        raw_outcomes[futures[future]] = future.result()
-
-        # 所有 stateful 操作都在主线程、模型原始调用顺序中完成。
-        outcomes = []
-        for call, args, raw_or_outcome in zip(calls, prepared_args, raw_outcomes):
-            # worker 已隔离 handler 异常；这里仍保留兜底，确保每个 tool_use
-            # 必有一个对应 tool_result，不会破坏 API 协议。
-            if raw_or_outcome is None:
-                outcome = classify_tool_result(
-                    call.name,
-                    "Error: worker did not return a result",
-                    status=INTERNAL_ERROR,
-                )
-            elif isinstance(raw_or_outcome, RawToolExecution):
-                outcome = _classify_raw_execution(call.name, raw_or_outcome)
-            else:
-                outcome = raw_or_outcome
-            outcomes.append(_finalize_outcome(outcome, args))
     results = [
         {"type": "tool_result", "tool_use_id": call.id, "content": outcome.content}
         for call, outcome in zip(calls, outcomes)

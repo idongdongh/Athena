@@ -9,7 +9,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.tool_guardrails import ToolCallGuardrailController
+from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+
+def hard_stop_controller():
+    """本脚本专门验证强制阻断路径，因此显式开启 hard stop。"""
+    return ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
 
 
 # ── 工具小函数：跑一个测试，红/绿打印 ────────────────────────────────────
@@ -26,7 +33,7 @@ def run_test(name, fn):
 # 同一 (bash, {"command": "rm x"}) 失败 5 次 → after_call 应在 count=5 时不 block，
 # 但下一次 before_call 应该 block（exact_failure_block_after=5）
 def test_exact_failure_blocks():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     args = {"command": "rm test.txt"}
     for _ in range(5):
@@ -42,7 +49,7 @@ def test_exact_failure_blocks():
 # 同 name 不同 args 失败 8 次 → after_call 第 8 次返回 halt
 # （same_tool_failure_halt_after=8）
 def test_same_tool_failure_halt():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     for i in range(7):
         args = {"command": f"cmd_{i}"}  # 每次不同 args，避免命中精确计数
@@ -61,7 +68,7 @@ def test_same_tool_failure_halt():
 # read_file 是 IDEMPOTENT。返回相同成功结果 5 次 → 前 4 次 after_call 记无进展，
 # 第 5 次 after_call 后仍是 warning；但第 5 次 before_call（再调时）应被 block
 def test_idempotent_no_progress_blocks():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     args = {"path": "config.yaml"}
     same_result = '{"content": "same old"}'
@@ -77,7 +84,7 @@ def test_idempotent_no_progress_blocks():
 # ── 测试 4：reset_for_turn 清空状态 ─────────────────────────────────────
 # 防止跨 turn 计数残留
 def test_reset_clears_state():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     # 制造一些失败
     for i in range(5):
@@ -94,7 +101,7 @@ def test_reset_clears_state():
 
 # ── 测试 5：warn 阈值（同 args 失败 2 次 → warn，未达 block）─────────────
 def test_warn_at_threshold():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     args = {"command": "rm x"}
     # 第 1 次：count=1，allow（<2 warn 阈值）
@@ -111,7 +118,7 @@ def test_warn_at_threshold():
 
 # ── 测试 6：成功路径不计失败（确保不影响后续）────────────────────────────
 def test_success_does_not_count_as_failure():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     c.reset_for_turn()
     args = {"path": "foo.py"}
     # 成功调用 5 次
@@ -126,7 +133,7 @@ def test_success_does_not_count_as_failure():
 
 
 def test_success_resets_failure_streak():
-    c = ToolCallGuardrailController()
+    c = hard_stop_controller()
     args = {"command": "flaky-command"}
     c.after_call("bash", args, '{"error": "temporary"}', failed=True)
     c.after_call("bash", args, '{"exit_code": 0}', failed=False)

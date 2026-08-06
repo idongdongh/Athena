@@ -14,6 +14,8 @@
 
 import json
 
+from agent.interrupt_controller import ToolExecutionCancelled, interrupt_controller
+
 try:
     from tools.registry import registry
 except ImportError:
@@ -24,6 +26,9 @@ from tools._binary import BINARY_EXTS
 MAX_READ_CHARS = 100_000  # 读结果字符上限（对齐 hermes ~100K），超限拒绝
 MAX_LIMIT = 2000
 DEFAULT_LIMIT = 500
+READ_CHUNK_BYTES = 64 * 1024
+# UTF-8 单字符最多 4 字节；只保留足以判断 100K 字符上限的数据。
+MAX_CAPTURE_BYTES = MAX_READ_CHARS * 4 + 1024
 
 
 def _add_line_numbers(content: str, start_line: int = 1) -> str:
@@ -32,6 +37,34 @@ def _add_line_numbers(content: str, start_line: int = 1) -> str:
     for i, line in enumerate(content.split("\n"), start=start_line):
         out.append(f"{i}|{line}")
     return "\n".join(out)
+
+
+def _iter_bounded_binary_lines(stream):
+    """逐行扫描二进制流，单行内存占用不超过 ``MAX_CAPTURE_BYTES``。"""
+    while True:
+        captured = bytearray()
+        line_too_large = False
+        saw_data = False
+
+        while True:
+            if interrupt_controller.is_requested():
+                raise ToolExecutionCancelled("read_file interrupted by user")
+            chunk = stream.readline(READ_CHUNK_BYTES)
+            if not chunk:
+                if saw_data:
+                    yield bytes(captured), line_too_large
+                return
+
+            saw_data = True
+            remaining = MAX_CAPTURE_BYTES - len(captured)
+            if remaining > 0:
+                captured.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                line_too_large = True
+
+            if chunk.endswith(b"\n"):
+                yield bytes(captured), line_too_large
+                break
 
 
 def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
@@ -61,23 +94,41 @@ def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
         if b"\x00" in bf.read(8192):
             return json.dumps({"error": f"Cannot read binary file '{path}'."}, ensure_ascii=False)
 
-    # 读全文；offset==1 时去 UTF-8 BOM（对齐 hermes）
-    text = fp.read_text(encoding="utf-8", errors="replace")
-    if offset == 1 and text.startswith("\ufeff"):
-        text = text.lstrip("\ufeff")
-
-    lines = text.splitlines()
-    total_lines = len(lines)
     end_line = offset + limit - 1
-    page_lines = lines[offset - 1:end_line]
+    total_lines = 0
+    page_lines: list[str] = []
+    captured_bytes = 0
+    output_too_large = False
+
+    # 扫描全文以计算 total_lines，但只保存请求页且设置固定捕获上限；因此内存
+    # 不再随文件大小增长。超长单行也会分块排空，不会一次读入内存。
+    with fp.open("rb") as bf:
+        for raw_line, line_too_large in _iter_bounded_binary_lines(bf):
+            total_lines += 1
+            if total_lines < offset or total_lines > end_line:
+                continue
+            if line_too_large:
+                output_too_large = True
+                continue
+
+            raw_line = raw_line.removesuffix(b"\n").removesuffix(b"\r")
+            captured_bytes += len(raw_line)
+            if captured_bytes > MAX_CAPTURE_BYTES:
+                output_too_large = True
+                continue
+            line = raw_line.decode("utf-8", errors="replace")
+            if total_lines == 1 and offset == 1:
+                line = line.lstrip("\ufeff")
+            page_lines.append(line)
+
     page = "\n".join(page_lines)
     content = _add_line_numbers(page, offset) if page_lines else ""
 
     # 字符上限：超限拒绝，提示用 offset/limit 缩小范围
-    if len(content) > MAX_READ_CHARS:
+    if output_too_large or len(content) > MAX_READ_CHARS:
         return json.dumps({
             "error": (
-                f"Read produced {len(content):,} characters which exceeds the safety limit "
+                f"Read exceeds the safety limit "
                 f"({MAX_READ_CHARS:,} chars). Use offset and limit to read a smaller range. "
                 f"The file has {total_lines} lines total."
             ),

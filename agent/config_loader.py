@@ -1,7 +1,5 @@
 """项目 YAML 配置加载。"""
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -12,7 +10,18 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def load_config(path: Path | str | None = None) -> dict:
-    """读取 YAML 配置；文件不存在时返回空配置，格式错误时阻止启动。"""
+    """读取 YAML 配置；支持读取指定路径的 yaml 文件；不存在时返回空配置，顶层必须是类字典格式否则报错，阻止启动。
+
+    Args:
+        path (Path | str | None, optional): 文件路径
+
+    Raises:
+        RuntimeError: _description_
+        RuntimeError: _description_
+
+    Returns:
+        dict: _description_
+    """
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     if not config_path.exists():
         return {}

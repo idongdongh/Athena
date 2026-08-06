@@ -1,7 +1,7 @@
 """工具调用重复检测控制器（per-turn 状态机）。
 
 核心状态机和 ``tool_loop_guardrails`` YAML 结构参考 Hermes
-``agent/tool_guardrails.py``；环境变量可以覆盖 warning 和 hard stop 开关。
+``agent/tool_guardrails.py``；护栏配置统一从 ``config.yaml`` 加载。
 
 重复检测分为三类：
 - **精确失败重复**：同一工具、相同参数连续失败，先警告，达到上限后 block。在工具调用结果提示正确情况下，用来检测模型是否重复输出相同调用。
@@ -12,15 +12,17 @@
 - ``allow``：允许执行 handler。
 - ``warn``：允许执行 handler，并在工具结果中加入换策略提示。
 - ``block``：在执行前拦截当前调用，不执行 handler，改为返回 synthetic result。
-- ``halt``：在执行后发现同一工具累计失败过多，停止继续调用工具。
+- ``halt``：在执行后发现同一工具累计失败过多；当前工具批次处理完成后，
+  主循环不再进入下一轮模型工具调用。
 
 ``block`` 和 ``halt`` 的触发时机不同，但都会写入 ``halt_decision``：
 - ``block`` 发生在 ``before_call()``，拦住尚未执行的重复调用；
 - ``halt`` 发生在 ``after_call()``，此时当前调用已经执行完毕。
 
-主循环在每批工具调用处理完成后检查 ``halt_decision``。只要其中已有决策，
-就结束当前 turn。控制器只保留本 turn 内出现的第一个停止决策，并在下一条
-用户请求开始时重置。
+主循环在每批工具调用处理完成后检查 ``halt_decision``。因此，同一批里已经
+通过预检的其他调用仍会按 Hermes 的批次语义执行；只要批次结束时已有停止
+决策，就结束当前 turn。控制器只保留本 turn 内出现的第一个停止决策，并在
+下一条用户请求开始时重置。
 
 与 Hermes 完整实现相比，本项目未包含插件回调和独立观测存储；Hermes 的
 ``terminal`` 工具在本项目中对应 ``bash``。
@@ -28,9 +30,8 @@
 
 import hashlib
 import json
-import os
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from agent.tool_result_classification import classify_tool_result
@@ -50,16 +51,16 @@ IDEMPOTENT_TOOL_NAMES = frozenset({
 })
 
 # ════════════════════════════════════════════════════════════════════════
-# 配置（Hermes YAML 结构 + 环境变量开关覆盖）
+# 配置（Hermes YAML 结构）
 # ════════════════════════════════════════════════════════════════════════
 # 阈值试验调出来的经验值。对齐 hermes ToolCallGuardrailConfig 默认。
-# warnings 和 hard stop 默认开启，也可由 YAML 或环境变量关闭。
+# warnings 默认开启，hard stop 默认关闭；都可在 config.yaml 中显式配置。
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
-    """重复检测阈值。YAML 配置结构与 Hermes ``tool_loop_guardrails`` 一致。"""
+    """重复检测阈值。"""
     warnings_enabled: bool = True
-    hard_stop_enabled: bool = True          # 开启强制阻断模式，也就是默认开 block/halt
+    hard_stop_enabled: bool = False          # 是否开启强制 block/halt
     exact_failure_warn_after: int = 2       # 在 2 次精确工具调用失败后触发 → warn
     exact_failure_block_after: int = 5      # 同 (name, args) 失败 5 次 → block
     same_tool_failure_warn_after: int = 3   # 同 name 失败 3 次 → warn
@@ -69,7 +70,7 @@ class ToolCallGuardrailConfig:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
-        """从 ``tool_loop_guardrails`` mapping 加载配置。"""
+        """从 YAML 配置中 tool_loop_guardrails 对应的那一层字典加载配置。"""
         if not isinstance(data, Mapping):
             return cls()
 
@@ -122,28 +123,6 @@ class ToolCallGuardrailConfig:
                 defaults.no_progress_block_after,
             ),
         )
-
-    def with_environment_overrides(self) -> "ToolCallGuardrailConfig":
-        """仅在环境变量显式存在时覆盖 YAML 中的两个开关。"""
-        return replace(
-            self,
-            warnings_enabled=_env_bool(
-                "TOOL_GUARDRAIL_WARNINGS", self.warnings_enabled
-            ),
-            hard_stop_enabled=_env_bool(
-                "TOOL_GUARDRAIL_HARD_STOP", self.hard_stop_enabled
-            ),
-        )
-
-    @classmethod
-    def from_environment(cls) -> "ToolCallGuardrailConfig":
-        """加载 .env 中的配置，没配置就用默认
-
-        Returns:
-            ToolCallGuardrailConfig: ToolCallGuardrailConfig 类对象
-        """
-        return cls().with_environment_overrides()
-
 
 # ════════════════════════════════════════════════════════════════════════
 # 调用指纹 + 决策（dataclass）
@@ -462,14 +441,6 @@ class ToolCallGuardrailController:
 # 工具函数：合成 blocked result + 追加 warning 后缀
 # ════════════════════════════════════════════════════════════════════════
 
-    """ 预检时调用 before_call 后，decision 中 action 字段不为 warn 或者 allow 时，合成假的工具调用 result 字符串（替代真执行）。
-
-    合成规则：
-    1. "error": decision.message,
-    2. "guardrail": decision.to_metadata(),
-    3. "blocked": True,
-
-    """
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
     """ 预检时调用 before_call 后，decision 的 action 字段为 block 时，合成假的工具调用 result 字符串（替代真执行）。
 
@@ -518,28 +489,6 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     if tool_name in {"web_search", "web_extract"}:
         return common + "请缩小关键词、更换查询或使用已获得的结果。"
     return common + "请改用不同参数、更窄的查询或其他工具。"
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """解析 .env 中配置的环境变量，真值：{"1", "true", "yes", "on", "enabled"}，都会被解析成 True
-    假值：{"0", "false", "no", "off", "disabled"}，被解析成 false
-
-    Args:
-        name (str): 待解析的环境变量名称
-        default (bool): 默认值
-
-    Returns:
-        bool: True/False
-    """
-    value = os.getenv(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "off", "disabled"}:
-        return False
-    return default
 
 
 def _as_bool(value: Any, default: bool) -> bool:

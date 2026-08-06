@@ -1,25 +1,34 @@
 import os
 import signal
 import sys
+import threading
+import time
+from enum import Enum
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from anthropic import Anthropic
 from anthropic.types import TextBlock, ToolUseBlock
 from dotenv import load_dotenv
+
+# 用于实现更好的命令行输入框
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import InMemoryHistory
-
-# 必须在导入 tool_executor 前加载：其模块级 guardrail 会读取环境开关。
-load_dotenv(override=True)
+from prompt_toolkit.key_binding import KeyBindings
 
 from tools.registry import registry, discover
+from agent.interrupt_controller import interrupt_controller
 from agent.provider_error_recovery import (
     ProviderRequestFailed,
     ProviderRequestInterrupted,
+    classify_provider_error,
     request_with_retries,
 )
 from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
 from agent.tracer import reset_tracer, get_tracer
+
+load_dotenv(override=True)
 
 # 启动期校验：api_key/model 缺失时抛友好 RuntimeError
 # 兼容两套命名（API_KEY / ANTHROPIC_API_KEY），与 web_extract_tool.py 保持一致
@@ -53,7 +62,7 @@ def _build_system() -> str:
 
 
 SYSTEM = _build_system()
-# 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾（对齐 hermes max_iterations 默认 90）
+# 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾
 MAX_ITERATIONS = 90
 # API 调用超时（秒）：防止网络层面无限期阻塞
 API_TIMEOUT = 300.0
@@ -66,22 +75,73 @@ TOOL_MAX_WORKERS = 4
 MAX_TOKENS_TOOL = 1024
 MAX_TOKENS_SUMMARY = int(os.getenv("MAX_TOKENS_SUMMARY", "4096"))
 
-# ---- 用户中断机制（对齐 hermes _interrupt_requested） ----
-_interrupt_requested = False
+
+# ---- agent_loop 的单点收尾 ----
+# 把"break + 写字符串 + 白名单同步"三件套收敛到一处：
+# 每个出口只赋 TurnOutcome，最终的"是否再走一次 summary 调用"由
+# outcome.needs_summary 单一判断，避免字符串白名单漏改。
+class TurnOutcome(Enum):
+    """agent_loop 一次 turn 的结束方式。"""
+
+    COMPLETED = "completed"                       # 模型自然 end_turn
+    INTERRUPTED = "interrupted"                   # 用户 Ctrl+C
+    GUARDRAIL_HALT = "guardrail_halt"             # guardrail 触发 halt
+    POST_TOOL_EMPTY = "post_tool_empty_response"  # 工具后空回复连续两次
+    INVALID_TOOL_LIMIT = "invalid_tool_limit"     # 未知工具连续 3 轮
+    ITERATION_BUDGET_EXHAUSTED = "iter_budget"    # 达到 MAX_ITERATIONS
+
+    @property
+    def needs_summary(self) -> bool:
+        """是否需要在主循环后再发一次无 tools 的 summary 调用。"""
+        return self is TurnOutcome.ITERATION_BUDGET_EXHAUSTED
+
+
+# ---- 用户中断机制 ----
+_last_interrupt_time = 0.0
+FORCE_QUIT_WINDOW_SECONDS = 2.0
 
 
 # signum：信号编号，不同编号对应不同的中断机制
 # frame：栈帧，当前程序执行的快照
 def _on_interrupt(signum, frame):
-    """第一次 Ctrl+C 设置中断标志；第二次 Ctrl+C 恢复默认行为，直接终止进程。"""
-    # 只要函数体内对全局变量执行了赋值操作（=），就必须在函数内声明 global
-    global _interrupt_requested
-    _interrupt_requested = True
+    """第一次 Ctrl+C 暂停当前任务；两秒内再次按下则退出程序。"""
+    global _last_interrupt_time
+    now = time.monotonic()
+    if interrupt_controller.is_requested():
+        if now - _last_interrupt_time < FORCE_QUIT_WINDOW_SECONDS:
+            print("\n\033[33m⚠️  Force quit requested.\033[0m")
+            # 由 REPL 的统一异常边界结束进程；agent_loop 的 finally 仍会先恢复
+            # SIGINT handler 和清理本轮中断状态。
+            raise KeyboardInterrupt
+        _last_interrupt_time = now
+        print(
+            "\n\033[33m⚠️  Pause still in progress — "
+            "press Ctrl+C again within 2 seconds to quit.\033[0m"
+        )
+        return
+    interrupt_controller.request()
+    _last_interrupt_time = now
     print(
-        "\n\033[33m⚠️  Interrupt requested — finishing after current API call..."
-        " (Ctrl+C again to force quit)\033[0m"
+        "\n\033[33m⚠️  Pause requested — keeping output generated so far... "
+        "(Ctrl+C again within 2 seconds to quit)\033[0m"
     )
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def _handle_idle_ctrl_c(event) -> None:
+    """空闲 REPL 中，优先清空已有输入；空输入框才退出。"""
+    buffer = event.app.current_buffer
+    if buffer.text:
+        buffer.reset()
+        event.app.invalidate()
+        return
+    event.app.exit(exception=KeyboardInterrupt)
+
+
+def _create_repl_key_bindings() -> KeyBindings:
+    """创建 REPL 按键绑定；运行中的 Ctrl+C 仍由 SIGINT handler 处理。"""
+    bindings = KeyBindings()
+    bindings.add("c-c")(_handle_idle_ctrl_c)
+    return bindings
 
 
 # 触发所有工具文件自注册：默认扫描 tools/ 下含 registry.register(...) 的模块并 import，
@@ -114,7 +174,12 @@ def _is_empty_model_response(res) -> bool:
 
 
 def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
-    """发现未知工具时返回整批 synthetic results；全部合法时返回 None。"""
+    """发现未知工具时返回整批 synthetic results：
+    1. 工具名为空："Tool call rejected: the tool name was empty. Use a valid name from the available tool list."
+    2. 工具名不在可调用名单中：Unknown tool: {工具名称}. Available tools: {可用工具清单：工具1， 工具2， ....}
+    3. 工具存在："Skipped: another tool call in this batch used an invalid name. Please retry this tool call."
+
+    本批调用工具全部存在时返回 None。"""
     invalid_names = {call.name for call in tool_calls if registry.get_entry(call.name) is None}
     if not invalid_names:
         return None
@@ -123,14 +188,17 @@ def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
     results = []
     for call in tool_calls:
         if call.name in invalid_names:
+            # tool name 为空
             if not call.name.strip():
                 content = (
                     "Tool call rejected: the tool name was empty. "
                     "Use a valid name from the available tool list."
                 )
             else:
+                # 未知工具，模型幻觉
                 content = f"Unknown tool: {call.name}. Available tools: {available}"
         else:
+            # 工具存在，但是由于这批次工具调用存在未知工具所以不调用。retry：重试
             content = (
                 "Skipped: another tool call in this batch used an invalid name. "
                 "Please retry this tool call."
@@ -143,34 +211,288 @@ def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
     return results
 
 
-def _append_file_mutation_notice(messages) -> None:
+def _append_file_mutation_notice(messages) -> str:
     """在最终回答后追加仍未恢复的文件修改失败，避免模型过度声称完成。"""
     notice = file_mutation_tracker.format_notice()
     if not notice or not messages or messages[-1].get("role") != "assistant":
-        return
+        return ""
     # 必须修改同一条 assistant 消息：相邻的 assistant 消息会破坏 API 的角色交替约束。
     messages[-1]["content"].append(TextBlock(type="text", text=notice))
+    return notice
+
+
+def _on_retry(error, retry_number, wait_seconds):
+    """打印 Provider 重试提示（_create_message_with_recovery / _stream_message_with_recovery 共用）。"""
+    print(
+        f"\033[33m⚠️  API {error.kind}，{wait_seconds:.1f} 秒后重试 "
+        f"（{retry_number}/3）\033[0m"
+    )
 
 
 def _create_message_with_recovery(**kwargs):
     """调用模型 Provider，并对暂时性错误执行有界重试。"""
-    def on_retry(error, retry_number, wait_seconds):
-        print(
-            f"\033[33m⚠️  API {error.kind}，{wait_seconds:.1f} 秒后重试 "
-            f"（{retry_number}/3）\033[0m"
-        )
-
     return request_with_retries(
         lambda: client.messages.create(**kwargs),
         max_retries=3,
-        is_interrupted=lambda: _interrupt_requested,
-        on_retry=on_retry,
+        # 这里为什么不直接传变量本身，如果传变量本身，那么 is_interrupted 的值就固定下来，
+        # 如果用户在重试的过程中按了 ctrl+c，is_interrupted 值不会变
+        is_interrupted=interrupt_controller.is_requested,
+        on_retry=_on_retry,
     )
 
 
-def agent_loop(messages):
-    global _interrupt_requested
-    _interrupt_requested = False
+class _StreamWorker:
+    """流式 Provider 请求 + 中断协作的单一封装。
+
+    SDK 的流迭代可能长时间阻塞在网络读取中，因此把整条调用链放进 daemon worker。
+    主线程持续轮询 Ctrl+C，主动 close 当前 stream、锁存一个 cancel signal；worker
+    通过同一个 signal 知道自己已被取消但仍会跑完资源清理。
+
+    锁、cancel signal、worker thread 都收到内部——外部只通过 6 个动作驱动：
+      - start()           启动 daemon worker
+      - poll(0.05)         轮询是否已结束
+      - request_cancel()  锁存本次请求已取消
+      - close_active()    主动关闭当前 stream，唤醒阻塞在迭代里的 worker
+      - drain(0.5)         取消后再等一段收尾窗口
+      - finalize()        取出 (response, error, partial_text, emitted_text)
+    """
+
+    POLL_INTERVAL = 0.05
+    POST_CANCEL_DRAIN = 0.5
+
+    def __init__(self, stream_method, stream_kwargs, on_text, on_retry):
+        self._state_lock = threading.Lock()
+        self._finished = threading.Event()
+        self._request_cancelled = threading.Event()
+        self._state = {
+            "manager": None,
+            "stream": None,
+            "response": None,
+            "error": None,
+            "text_parts": [],
+            "emitted_text": False,
+        }
+        self._stream_method = stream_method
+        self._stream_kwargs = stream_kwargs
+        self._on_text = on_text
+        self._on_retry = on_retry
+
+    def _is_cancelled(self) -> bool:
+        # request_cancelled 是本次请求的锁存信号：agent_loop 返回后会清除全局
+        # controller，但遗留 worker 仍必须知道自己已经被取消。
+        return self._request_cancelled.is_set() or interrupt_controller.is_requested()
+
+    def _consume_stream(self) -> None:
+        manager = None
+        try:
+            def open_stream():
+                # Provider 的 stream 创建和 __enter__ 可能阻塞网络，不能持有
+                # 状态锁；否则主线程中断时 close_active() 会卡在等同一把锁。
+                candidate_manager = self._stream_method(**self._stream_kwargs)
+                candidate_stream = candidate_manager.__enter__()
+                with self._state_lock:
+                    self._state["manager"] = candidate_manager
+                    self._state["stream"] = candidate_stream
+                return candidate_manager, candidate_stream
+
+            manager, stream = request_with_retries(
+                open_stream,
+                max_retries=3,
+                is_interrupted=self._is_cancelled,
+                on_retry=self._on_retry,
+            )
+            # 中断可能发生在 __enter__ 阻塞期间。当时 stream 尚未发布，
+            # close_active() 无对象可关；建立完成后在迭代前再次检查即可由
+            # finally 调用 manager.__exit__，避免进入下一次阻塞读取。
+            if self._is_cancelled():
+                return
+            for event in stream:
+                if self._is_cancelled():
+                    break
+                if (
+                    getattr(event, "type", None) == "content_block_delta"
+                    and getattr(getattr(event, "delta", None), "type", None) == "text_delta"
+                ):
+                    delta = event.delta.text
+                    if delta:
+                        with self._state_lock:
+                            self._state["text_parts"].append(delta)
+                            self._state["emitted_text"] = True
+                        if self._on_text is not None:
+                            self._on_text(delta)
+            if not self._is_cancelled():
+                self._state["response"] = stream.get_final_message()
+        except (ProviderRequestFailed, ProviderRequestInterrupted) as exc:
+            self._state["error"] = exc
+        except Exception as exc:
+            if not self._is_cancelled():
+                # 流式输出一旦开始就不能安全重试，否则用户会看到重复文本。
+                self._state["error"] = ProviderRequestFailed(
+                    classify_provider_error(exc),
+                    exc,
+                )
+        finally:
+            if manager is not None:
+                try:
+                    manager.__exit__(None, None, None)
+                except Exception as exc:
+                    if not self._is_cancelled() and self._state["error"] is None:
+                        self._state["error"] = ProviderRequestFailed(
+                            classify_provider_error(exc),
+                            exc,
+                        )
+            self._finished.set()
+
+    def start(self) -> None:
+        """启动 daemon worker。"""
+        threading.Thread(target=self._consume_stream, name="model-stream", daemon=True).start()
+
+    def poll(self, timeout: float) -> bool:
+        """等待 worker 完成；返回 True 表示已结束。"""
+        return self._finished.wait(timeout)
+
+    def request_cancel(self) -> None:
+        """锁存本次请求已取消。worker 仍会跑完，但结果被丢弃。"""
+        self._request_cancelled.set()
+
+    def close_active(self) -> None:
+        """主动关闭当前 stream，唤醒阻塞在迭代里的 worker。"""
+        with self._state_lock:
+            active_stream = self._state["stream"]
+        if active_stream is not None:
+            try:
+                active_stream.close()
+            except Exception:
+                pass
+
+    def drain(self, timeout: float) -> None:
+        """取消后等一段收尾窗口；即使 Provider 不响应，daemon worker 也不会拖住主线程。"""
+        self._finished.wait(timeout)
+
+    def finalize(self) -> tuple[Any, Exception | None, str, bool]:
+        """取出 worker 写完的所有状态。"""
+        with self._state_lock:
+            return (
+                self._state["response"],
+                self._state["error"],
+                "".join(self._state["text_parts"]),
+                self._state["emitted_text"],
+            )
+
+
+def _stream_message_with_recovery(
+    *,
+    on_text: Callable[[str], None] | None = None,
+    **kwargs,
+):
+    """流式请求模型；中断时返回已生成的文本，不保留未完成的工具调用。
+
+    测试 fake client 若没有 ``messages.stream``，自动回退到普通 create 接口。
+    流建立前的错误沿用 Provider 重试；流已经开始后不自动重放，避免重复输出。
+    """
+    stream_method = getattr(client.messages, "stream", None)
+    if not callable(stream_method):
+        return _create_message_with_recovery(**kwargs), False
+
+    stream_kwargs = dict(kwargs)
+    request_timeout = stream_kwargs.pop("timeout", None)
+    with_options = getattr(client, "with_options", None)
+    if request_timeout is not None and callable(with_options):
+        stream_client = with_options(timeout=request_timeout)
+        stream_method = stream_client.messages.stream
+
+    worker = _StreamWorker(stream_method, stream_kwargs, on_text, _on_retry)
+    worker.start()
+
+    while not worker.poll(_StreamWorker.POLL_INTERVAL):
+        if not interrupt_controller.is_requested():
+            continue
+        worker.request_cancel()
+        worker.close_active()
+        break
+
+    if interrupt_controller.is_requested():
+        worker.request_cancel()
+        # 给 close 后的 worker 一个短暂收尾窗口；即使 Provider 不响应，daemon
+        # worker 也不会阻止 REPL 立即返回或第二次 Ctrl+C 退出进程。
+        worker.drain(_StreamWorker.POST_CANCEL_DRAIN)
+        _, _, partial_text, _ = worker.finalize()
+        content = (
+            [TextBlock(type="text", text=partial_text)]
+            if partial_text
+            else []
+        )
+        return SimpleNamespace(stop_reason="interrupted", content=content), True
+
+    response, error, _, emitted_text = worker.finalize()
+    if error is not None:
+        raise error
+    if emitted_text and on_text is not None:
+        on_text("\n")
+    return response, False
+
+
+def _paused_text_blocks(content) -> tuple[list[TextBlock], bool]:
+    """仅保留模型已经生成的文本，丢弃未执行或未完成的工具调用。
+
+    返回 (blocks, is_placeholder)：is_placeholder=True 表示模型没来得及输出任何文本，
+    blocks 是构造的兜底占位文本；UI 打印时需明确标注，避免被误以为是模型说的。
+    """
+    blocks = [block for block in content if isinstance(block, TextBlock) and block.text]
+    if blocks:
+        return blocks, False
+    return [TextBlock(type="text", text="[任务已暂停，模型尚未返回文本]")], True
+
+
+def _emit_assistant_message(
+    messages,
+    text: str,
+    *,
+    stream_output: bool,
+    is_placeholder: bool = False,
+    stream_message: str = "",
+) -> None:
+    """往 messages 追加一条 assistant 文本消息，并在 stream_output 时打印。
+
+    占位文本（pause 后无模型输出）会被显式标注，避免被误以为是模型说的。
+    """
+    messages.append({
+        "role": "assistant",
+        "content": [TextBlock(type="text", text=text)],
+    })
+    if stream_output:
+        if is_placeholder:
+            print(f"\033[90m【暂停占位】{text}\033[0m")
+        elif stream_message:
+            print(stream_message)
+        else:
+            print(text)
+
+
+def _request_summary(messages, *, stream_output: bool) -> None:
+    """迭代预算耗尽后，去掉 tools 再请求一次纯文本总结。"""
+    label = f"iteration budget exhausted ({MAX_ITERATIONS}/{MAX_ITERATIONS})"
+    # 真正的 api_call_count 由调用方在调用 _request_summary 之前已 ++
+    print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
+    res, _ = _stream_message_with_recovery(
+        model=MODEL_ID,  # type: ignore
+        messages=messages,
+        system=(
+            SYSTEM
+            + "\nThe tool iteration budget is exhausted. Reply with a concise plain-text "
+            "summary only. Do not call tools or emit tool-call markup."
+        ),
+        max_tokens=MAX_TOKENS_SUMMARY,
+        timeout=API_TIMEOUT,
+        on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
+    )
+    messages.append({"role": "assistant", "content": res.content})
+
+
+def agent_loop(messages, *, stream_output: bool = False):
+    global _last_interrupt_time
+    interrupt_controller.clear()
+    _last_interrupt_time = 0.0
 
     # 每条用户请求开始时，重置重复调用计数、halt 锁存、文件修改失败记录。
     tool_guardrails.reset_for_turn()
@@ -179,26 +501,33 @@ def agent_loop(messages):
     # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
     tr = reset_tracer()
 
-    # 设置 SIGINT 信号的处理函数
+    # 仅在模型执行期间接管 Ctrl+C；结束后恢复进入函数前的 handler。
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, _on_interrupt)
 
+    # 当前用户请求已经向模型发起的 API 调用次数，用于限制最大迭代轮数。
     api_call_count = 0
-    exit_reason = None
-    awaiting_tool_followup = False
+    # 本轮停止的原因；正常完成、中断或异常收尾时写入对应标识。
+    outcome: TurnOutcome | None = None
+    # 上一轮是否调过工具（用于检测"工具执行后模型空回复"异常）。
+    prev_step_had_tool_calls = False
+    # 工具执行后模型首次返回空回复时是否已经做过一次补救，避免无限重试。
     post_tool_empty_retried = False
+    # 本轮模型调用未知工具的连续重试次数，达到上限后停止本轮。
     invalid_tool_retries = 0
 
     try:
-        while api_call_count < MAX_ITERATIONS and not _interrupt_requested:
+        while api_call_count < MAX_ITERATIONS and not interrupt_controller.is_requested():
             api_call_count += 1
             tr.step_start(api_call_count, len(messages), True, query=_last_user_text(messages))
-            res = _create_message_with_recovery(
+            res, stream_interrupted = _stream_message_with_recovery(
                 model=MODEL_ID,
                 messages=messages,
                 system=SYSTEM,
                 max_tokens=MAX_TOKENS_TOOL,
                 tools=registry.definitions(),
                 timeout=API_TIMEOUT,
+                on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
             )
 
             tr.step_done(
@@ -209,7 +538,20 @@ def agent_loop(messages):
                 assistant_text=_assistant_text(res),
             )
 
-            if awaiting_tool_followup and _is_empty_model_response(res):
+            if stream_interrupted:
+                paused_content, is_placeholder = _paused_text_blocks(res.content)
+                messages.append({"role": "assistant", "content": paused_content})
+                if stream_output and not res.content:
+                    text = paused_content[0].text
+                    if is_placeholder:
+                        print(f"\033[90m【暂停占位】{text}\033[0m")
+                    else:
+                        print(text)
+                outcome = TurnOutcome.INTERRUPTED
+                break
+
+            # 处理工具调用之后模型返回空消息的响应异常，给模型一次重试机会，重试失败就退出
+            if prev_step_had_tool_calls and _is_empty_model_response(res):
                 if not post_tool_empty_retried:
                     post_tool_empty_retried = True
                     messages.extend([
@@ -228,28 +570,33 @@ def agent_loop(messages):
                     print("\033[33m⚠️  模型在工具执行后返回空回复，正在补救一次...\033[0m")
                     continue
 
-                messages.append({
-                    "role": "assistant",
-                    "content": [TextBlock(
-                        type="text",
-                        text="[模型在工具执行后连续返回空回复，本轮已停止]",
-                    )],
-                })
-                exit_reason = "post_tool_empty_response"
+                stopped_text = "[模型在工具执行后连续返回空回复，本轮已停止]"
+                _emit_assistant_message(
+                    messages, stopped_text, stream_output=stream_output
+                )
+                outcome = TurnOutcome.POST_TOOL_EMPTY
                 break
 
             messages.append({"role": "assistant", "content": res.content})
-            awaiting_tool_followup = False
+            prev_step_had_tool_calls = False
 
             if res.stop_reason != "tool_use":
-                exit_reason = "completed"
+                outcome = TurnOutcome.COMPLETED
                 break
-            if _interrupt_requested:
-                # 当前 assistant 只包含尚未执行的 tool_use，必须移除后才能总结。
-                messages.pop()
-                exit_reason = "interrupted"
+            if interrupt_controller.is_requested():
+                # 不执行模型刚生成的工具调用，只保留它在暂停前已经输出的文本。
+                paused_content, is_placeholder = _paused_text_blocks(res.content)
+                messages[-1]["content"] = paused_content
+                if stream_output and not any(isinstance(b, TextBlock) and b.text for b in res.content):
+                    text = paused_content[0].text
+                    if is_placeholder:
+                        print(f"\033[90m【暂停占位】{text}\033[0m")
+                    else:
+                        print(text)
+                outcome = TurnOutcome.INTERRUPTED
                 break
 
+            # 检查当前批次模型需要调用的工具是否存在，如果模型在本轮调用了三次或者以上的未知工具，直接 break
             tool_calls = [
                 block for block in res.content if isinstance(block, ToolUseBlock)
             ]
@@ -262,16 +609,13 @@ def agent_loop(messages):
                     f"（{invalid_tool_retries}/3）\033[0m"
                 )
                 if invalid_tool_retries >= 3:
-                    messages.append({
-                        "role": "assistant",
-                        "content": [TextBlock(
-                            type="text",
-                            text="[模型连续三轮调用未知工具，本轮已停止]",
-                        )],
-                    })
-                    exit_reason = "invalid_tool_limit"
+                    stopped_text = "[模型连续三轮调用未知工具，本轮已停止]"
+                    _emit_assistant_message(
+                        messages, stopped_text, stream_output=stream_output
+                    )
+                    outcome = TurnOutcome.INVALID_TOOL_LIMIT
                     break
-                awaiting_tool_followup = True
+                prev_step_had_tool_calls = True
                 continue
 
             invalid_tool_retries = 0
@@ -282,9 +626,9 @@ def agent_loop(messages):
                 messages,
                 concurrent=CONCURRENT_TOOLS,
                 max_workers=TOOL_MAX_WORKERS,
-                is_cancelled=lambda: _interrupt_requested,
+                is_cancelled=interrupt_controller.is_requested,
             )
-            awaiting_tool_followup = True
+            prev_step_had_tool_calls = True
 
             # 与 Hermes 一致：guardrail halt 是一个明确的受控结束，不再额外调用模型总结。
             halt_decision = tool_guardrails.halt_decision
@@ -296,40 +640,47 @@ def agent_loop(messages):
                     "role": "assistant",
                     "content": [TextBlock(type="text", text=halt_text)],
                 })
-                exit_reason = "guardrail_halt"
+                outcome = TurnOutcome.GUARDRAIL_HALT
                 break
 
-        # 正常完成和 guardrail 受控结束都已有最终 assistant 消息，直接返回。
-        if exit_reason in {
-            "completed", "guardrail_halt", "post_tool_empty_response", "invalid_tool_limit",
-        }:
-            _append_file_mutation_notice(messages)
-            tr.finish(exit_reason, api_call_count)
-            return
+        # 主循环结束但还没确定 outcome → 要么 iter 预算耗尽，要么 iter 中收到中断。
+        if outcome is None:
+            if interrupt_controller.is_requested():
+                # 可能在工具执行期间收到暂停信号。工具结果已经写回时，补一条
+                # assistant 占位消息，保持下一轮请求的角色与工具协议完整。
+                if not messages or messages[-1].get("role") != "assistant":
+                    paused_content, is_placeholder = _paused_text_blocks([])
+                    messages.append({"role": "assistant", "content": paused_content})
+                    if stream_output:
+                        text = paused_content[0].text
+                        if is_placeholder:
+                            print(f"\033[90m【暂停占位】{text}\033[0m")
+                        else:
+                            print(text)
+                outcome = TurnOutcome.INTERRUPTED
+            else:
+                outcome = TurnOutcome.ITERATION_BUDGET_EXHAUSTED
 
-        # 只有迭代预算耗尽或中断在未完成工具轮时，才去掉 tools 请求一次收尾总结。
-        if _interrupt_requested:
-            label = f"interrupted at {api_call_count}/{MAX_ITERATIONS}"
+        # 唯一决策点：是否需要再发一次 summary 调用。
+        # summary 不算入 api_call_count——它本质上是"预算耗尽"事件的副作用。
+        if outcome.needs_summary:
+            _request_summary(messages, stream_output=stream_output)
+
+        notice = _append_file_mutation_notice(messages)
+        if stream_output and notice:
+            print(notice)
+        if outcome is TurnOutcome.ITERATION_BUDGET_EXHAUSTED:
+            tr.finish(
+                f"iteration budget exhausted ({api_call_count}/{MAX_ITERATIONS})",
+                api_call_count,
+            )
         else:
-            label = f"iteration budget exhausted ({api_call_count}/{MAX_ITERATIONS})"
-        print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
-        res = _create_message_with_recovery(
-            model=MODEL_ID,  # type: ignore
-            messages=messages,
-            system=SYSTEM,
-            max_tokens=MAX_TOKENS_SUMMARY,
-            timeout=API_TIMEOUT,
-        )
-        messages.append({"role": "assistant", "content": res.content})
-        _append_file_mutation_notice(messages)
-        tr.finish(label, api_call_count)
+            tr.finish(outcome.value, api_call_count)
 
     except ProviderRequestInterrupted:
         get_tracer().finish("provider_retry_interrupted", api_call_count)
-        messages.append({
-            "role": "assistant",
-            "content": [TextBlock(type="text", text="[API 重试已被用户中断]")],
-        })
+        interrupted_text = "[API 重试已被用户暂停]"
+        _emit_assistant_message(messages, interrupted_text, stream_output=stream_output)
     except ProviderRequestFailed as exc:
         error = exc.error
         detail = str(exc.cause).replace("\n", " ")[:500]
@@ -339,32 +690,11 @@ def agent_loop(messages):
         if detail:
             message += f"：{detail}"
         get_tracer().finish(f"provider_error:{error.kind}", api_call_count)
-        messages.append({
-            "role": "assistant",
-            "content": [TextBlock(type="text", text=message)],
-        })
-    except KeyboardInterrupt:
-        get_tracer().finish("force_quit", api_call_count)
-        # 第二次 Ctrl+C（_on_interrupt 已把 SIGINT 复位为 SIG_DFL）：强制中断，不崩 REPL
-        print("\n\033[33m⚠️  Force quit — 已中断当前任务，返回输入提示。\033[0m")
-        # 修复消息历史，避免下轮 API 因「角色不交替」或「tool_use 缺 tool_result」而 400
-        if messages:
-            last = messages[-1]
-            # 丢掉未完成的 assistant(tool_use)（没有对应 tool_result）
-            if last.get("role") == "assistant" and any(
-                getattr(b, "type", None) == "tool_use" for b in last.get("content", [])
-            ):
-                messages.pop()
-            # 若仍以 user 结尾，补一条 assistant 占位，保证下轮 user/assistant 交替
-            if messages and messages[-1].get("role") == "user":
-                messages.append({
-                    "role": "assistant",
-                    "content": [TextBlock(type="text", text="[任务被用户中断]")],
-                })
+        _emit_assistant_message(messages, message, stream_output=stream_output)
     finally:
-        # 恢复默认 SIGINT 行为，确保外层 REPL 的 input() 正常响应 Ctrl+C
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        _interrupt_requested = False
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        interrupt_controller.clear()
+        _last_interrupt_time = 0.0
 
 
 if __name__ == "__main__":
@@ -373,28 +703,30 @@ if __name__ == "__main__":
     history = []
     # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
     prompt_session = (
-        PromptSession(history=InMemoryHistory()) if sys.stdin.isatty() else None
+        PromptSession(
+            history=InMemoryHistory(),
+            key_bindings=_create_repl_key_bindings(),
+        )
+        if sys.stdin.isatty()
+        else None
     )
     # 持续接收用户输入
     while True:
-        # 接收用户输入，并检查是否退出
+        # REPL 是统一退出边界：既处理空闲输入时的 Ctrl+C，也接住任务运行期间
+        # 第二次 Ctrl+C 抛出的 KeyboardInterrupt。
         try:
             if prompt_session is not None:
                 query = prompt_session.prompt(ANSI("\033[33m >> \033[0m"))
             else:
                 # 管道输入不是交互终端，保留 input() 以支持脚本和 smoke test。
                 query = input("\033[33m >> \033[0m")
+            if query.strip().lower() in ("q", "exit", ""):
+                break
+
+            # 将用户 query 追加到历史消息列表中
+            history.append({"role": "user", "content": query})
+
+            agent_loop(history, stream_output=True)
         except (EOFError, KeyboardInterrupt):
             print("\n收到终止信号，退出交互")
             break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-
-        # 将用户 query 追加到历史消息列表中
-        history.append({"role": "user", "content": query})
-
-        agent_loop(history)
-
-        for block in history[-1]["content"]:
-            if block.type == "text":
-                print(block.text)

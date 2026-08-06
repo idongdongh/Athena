@@ -14,6 +14,8 @@ import json
 import re
 from pathlib import Path
 
+from agent.interrupt_controller import ToolExecutionCancelled, interrupt_controller
+
 try:
     from tools.registry import registry
 except ImportError:
@@ -27,6 +29,7 @@ _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".idea", "
 def _iter_files(root: Path, file_glob: str = None):
     """遍历 root 下文本文件，跳过垃圾目录与二进制扩展名，可选 file_glob 过滤。"""
     for p in root.rglob("*"):
+        interrupt_controller.raise_if_requested("search_files interrupted by user")
         if p.is_dir():
             continue
         if any(part in _SKIP_DIRS for part in p.parts):
@@ -73,6 +76,7 @@ def search_files(pattern: str, target: str = "content", path: str = ".",
     truncated = False
 
     for f in files:
+        interrupt_controller.raise_if_requested("search_files interrupted by user")
         if output_mode == "content" and match_count >= limit:
             truncated = True
             break
@@ -81,11 +85,17 @@ def search_files(pattern: str, target: str = "content", path: str = ".",
             break
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
+        except ToolExecutionCancelled:
+            raise
         except Exception:
             continue
         lines = text.splitlines()
         file_matches = []
         for i, line in enumerate(lines, 1):
+            if i % 256 == 0:
+                interrupt_controller.raise_if_requested(
+                    "search_files interrupted by user"
+                )
             if regex.search(line):
                 file_matches.append((i, line))
         if not file_matches:

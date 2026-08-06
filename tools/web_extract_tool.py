@@ -27,6 +27,11 @@ except ImportError:
 
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from agent.interrupt_controller import (
+    ToolExecutionCancelled,
+    interrupt_controller,
+    run_interruptible,
+)
 # 显式定位项目根 .env，避免从不同 cwd 运行时找不到
 _here = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_here, "..", ".env"), override=True)
@@ -94,19 +99,31 @@ def _summarize_chunk(text: str, max_chars: int) -> str:
     model = os.getenv("SUMMARY_MODEL_ID") or os.getenv("MODEL_ID", "")
     if not model:
         raise RuntimeError("MODEL_ID 未设置，无法调用摘要模型")
-    resp = client.messages.create(
-        model=model,
-        # max_chars 是字符预算，不可直接当 token 数。Hermes 的摘要调用使用固定上限；
-        # 这里按请求大小缩放，但始终限制在模型可接受的单次输出范围内。
-        max_tokens=min(MAX_SUMMARY_TOKENS, max(256, max_chars)),
-        messages=[{
-            "role": "user",
-            "content": (
-                f"请将以下网页正文总结为简洁的 markdown 要点列表，保留关键事实、数字、"
-                f"人名、日期和主要结论。输出必须不超过 {max_chars} 字符。\n\n"
-                f"---BEGIN CONTENT---\n{text}\n---END CONTENT---"
-            ),
-        }],
+    def cancel_summary_request() -> None:
+        global _summary_client
+        try:
+            client.close()
+        finally:
+            if _summary_client is client:
+                _summary_client = None
+
+    resp = run_interruptible(
+        lambda: client.messages.create(
+            model=model,
+            # max_chars 是字符预算，不可直接当 token 数。Hermes 的摘要调用使用固定上限；
+            # 这里按请求大小缩放，但始终限制在模型可接受的单次输出范围内。
+            max_tokens=min(MAX_SUMMARY_TOKENS, max(256, max_chars)),
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"请将以下网页正文总结为简洁的 markdown 要点列表，保留关键事实、数字、"
+                    f"人名、日期和主要结论。输出必须不超过 {max_chars} 字符。\n\n"
+                    f"---BEGIN CONTENT---\n{text}\n---END CONTENT---"
+                ),
+            }],
+        ),
+        on_cancel=cancel_summary_request,
+        thread_name="web-summary-request",
     )
     summary = "".join(getattr(b, "text", "") for b in resp.content)
     return summary.strip()[:max_chars]
@@ -118,7 +135,10 @@ def _summarize_long_text(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
         return _summarize_chunk(text, max_chars)
     # 长文分块（每块 100k，hermes 行为）
     parts = [text[i:i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-    chunk_summaries = [_summarize_chunk(p, max_chars) for p in parts]
+    chunk_summaries = []
+    for part in parts:
+        interrupt_controller.raise_if_requested("web_extract interrupted by user")
+        chunk_summaries.append(_summarize_chunk(part, max_chars))
     combined = "\n\n".join(chunk_summaries)
     # 合成后通常仍超 max_chars，再做一次收口摘要
     if len(combined) > max_chars:
@@ -145,17 +165,27 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
         max_chars = MAX_OUTPUT_CHARS
     max_chars = min(max(max_chars, 1), MAX_OUTPUT_CHARS)
 
+    client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+    close_client = getattr(client, "close", lambda: None)
     try:
-        client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-        resp = client.extract(urls=urls, timeout=30)
+        resp = run_interruptible(
+            lambda: client.extract(urls=urls, timeout=30),
+            on_cancel=close_client,
+            thread_name="web-extract-request",
+        )
+    except ToolExecutionCancelled:
+        raise
     except Exception as exc:
         msg = str(exc)
         if "timed out" in msg.lower():
             msg = "抽取超时(>30s)：页面可能过大或无响应，建议换更聚焦的 URL，或先用 web_search 取摘要。"
         return json.dumps({"success": False, "error": msg}, ensure_ascii=False)
+    finally:
+        close_client()
 
     results = []
     for item in resp.get("results", []):
+        interrupt_controller.raise_if_requested("web_extract interrupted by user")
         url = item.get("url", "")
         content = item.get("raw_content", "") or item.get("content", "")
 
@@ -184,6 +214,8 @@ def web_extract(urls, max_chars: int = MAX_OUTPUT_CHARS) -> str:
                 final = _summarize_long_text(content, max_chars)
                 was_summarized = True
                 is_truncated = True
+            except ToolExecutionCancelled:
+                raise
             except Exception as e:
                 print(f"[web_extract] 摘要失败，已回退截断：{e}", file=sys.stderr)
                 final = _trim(content, max_chars)

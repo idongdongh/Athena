@@ -1,10 +1,8 @@
 """tool_loop_guardrails YAML 配置测试。"""
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from agent.config_loader import load_config
 from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
@@ -96,22 +94,6 @@ class GuardrailConfigTests(unittest.TestCase):
         self.assertEqual(config.exact_failure_warn_after, defaults.exact_failure_warn_after)
         self.assertEqual(config.same_tool_failure_warn_after, defaults.same_tool_failure_warn_after)
         self.assertEqual(config.no_progress_warn_after, defaults.no_progress_warn_after)
-
-    def test_environment_only_overrides_explicitly_set_switches(self):
-        yaml_config = ToolCallGuardrailConfig.from_mapping({
-            "warnings_enabled": False,
-            "hard_stop_enabled": False,
-        })
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(yaml_config.with_environment_overrides(), yaml_config)
-        with patch.dict(
-            os.environ,
-            {"TOOL_GUARDRAIL_WARNINGS": "true", "TOOL_GUARDRAIL_HARD_STOP": "on"},
-            clear=True,
-        ):
-            overridden = yaml_config.with_environment_overrides()
-        self.assertTrue(overridden.warnings_enabled)
-        self.assertTrue(overridden.hard_stop_enabled)
 
     def test_yaml_threshold_changes_controller_behavior(self):
         config = ToolCallGuardrailConfig.from_mapping({

@@ -9,6 +9,10 @@
 2. 按 `requirements.txt` 创建环境并安装依赖。
 3. 运行 `python -m agent.conversation_loop`。
 
+模型回复会流式显示。任务运行期间第一次按 `Ctrl+C` 会主动关闭当前模型流、
+终止正在运行的 bash 进程组，并保留模型已经输出的文本；2 秒内再次按下会退出
+程序。REPL 空闲时，输入框有内容则 `Ctrl+C` 清空输入，输入框为空才退出。
+
 运行测试：
 
 ```bash
@@ -37,12 +41,8 @@ tool_use → preflight → handler（可并发）→ 主线程顺序归并
 
 工具循环阈值在项目根目录 `config.yaml` 的 `tool_loop_guardrails` 中配置。
 配置结构与 Hermes 一致，包含 `warnings_enabled`、`hard_stop_enabled`、
-`warn_after` 和 `hard_stop_after`。配置在进程启动时读取一次；修改后需要重启 Agent。
-
-环境变量可以覆盖 YAML 中的两个开关：
-
-- `TOOL_GUARDRAIL_WARNINGS`：是否追加重复失败提示，默认 `true`。
-- `TOOL_GUARDRAIL_HARD_STOP`：是否在达到阈值时熔断，默认 `true`。
+`warn_after` 和 `hard_stop_after`。护栏不读取环境变量；配置在进程启动时读取一次，
+修改后需要重启 Agent。配置文件或字段缺失时使用代码中的默认值。
 
 ## 目录结构
 
