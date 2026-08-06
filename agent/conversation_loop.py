@@ -1,16 +1,22 @@
+import os
 import signal
+import sys
+
 from anthropic import Anthropic
 from anthropic.types import TextBlock, ToolUseBlock
 from dotenv import load_dotenv
-import os
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.history import InMemoryHistory
 
-from tools.registry import registry, discover
-from agent.tool_executor import run_tool_calls, tool_guardrails
-from agent.tracer import reset_tracer, get_tracer
-
+# 必须在导入 tool_executor 前加载：其模块级 guardrail 会读取环境开关。
 load_dotenv(override=True)
 
-# 启动期校验：key/model 缺失时抛友好 RuntimeError，而不是让 SDK 拿到 None 后抛栈
+from tools.registry import registry, discover
+from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
+from agent.tracer import reset_tracer, get_tracer
+
+# 启动期校验：api_key/model 缺失时抛友好 RuntimeError
 # 兼容两套命名（API_KEY / ANTHROPIC_API_KEY），与 web_extract_tool.py 保持一致
 _api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("API_KEY")
 if not _api_key:
@@ -40,25 +46,21 @@ def _build_system() -> str:
     )
 
 
-# 会话级快照：import 时建一次，主循环与收尾总结共用，保证整个会话 system prompt 稳定
 SYSTEM = _build_system()
 # 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾（对齐 hermes max_iterations 默认 90）
 MAX_ITERATIONS = 90
 # API 调用超时（秒）：防止网络层面无限期阻塞
 API_TIMEOUT = 300.0
 # 工具并发执行：仅工具名互不重复的只读调用会并行；bash、写操作和重复调用顺序执行。
-# Hermes 通过审批回调和跨线程状态传播支持更宽的并发，本项目保留安全子集。
 CONCURRENT_TOOLS = True
 # 并发线程池上限
 TOOL_MAX_WORKERS = 4
 # 单轮 API 输出 token 上限：tool_use 块本就小，1024 够；summary 轮要产长文本，
-# 默认 4096（对齐 hermes handle_max_iterations 的 `or 4096` 兜底语义），
 # 允许 .env 覆盖（MAX_TOKENS_SUMMARY=8192）。
 MAX_TOKENS_TOOL = 1024
 MAX_TOKENS_SUMMARY = int(os.getenv("MAX_TOKENS_SUMMARY", "4096"))
 
 # ---- 用户中断机制（对齐 hermes _interrupt_requested） ----
-# Python 规则：任何函数内对模块级变量执行赋值（=），必须在函数内声明 global。
 _interrupt_requested = False
 
 
@@ -99,12 +101,22 @@ def _assistant_text(res):
                    if getattr(b, "type", None) == "text")
 
 
+def _append_file_mutation_notice(messages) -> None:
+    """在最终回答后追加仍未恢复的文件修改失败，避免模型过度声称完成。"""
+    notice = file_mutation_tracker.format_notice()
+    if not notice or not messages or messages[-1].get("role") != "assistant":
+        return
+    # 必须修改同一条 assistant 消息：相邻的 assistant 消息会破坏 API 的角色交替约束。
+    messages[-1]["content"].append(TextBlock(type="text", text=notice))
+
+
 def agent_loop(messages):
     global _interrupt_requested
     _interrupt_requested = False
 
-    # 每条用户请求开始时，重置重复调用计数和 halt 锁存。
+    # 每条用户请求开始时，重置重复调用计数、halt 锁存、文件修改失败记录。
     tool_guardrails.reset_for_turn()
+    file_mutation_tracker.reset_for_turn()
 
     # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
     tr = reset_tracer()
@@ -112,9 +124,6 @@ def agent_loop(messages):
     # 设置 SIGINT 信号的处理函数
     signal.signal(signal.SIGINT, _on_interrupt)
 
-    # 提前初始化：确保 except KeyboardInterrupt 分支里的引用一定绑过
-    # （Pylance reportPossiblyUnboundVariable；运行时若 while 一次不进 + 立即
-    # Ctrl+C，api_call_count 会 UnboundLocalError）
     api_call_count = 0
     exit_reason = None
 
@@ -150,10 +159,16 @@ def agent_loop(messages):
                 break
 
             # 把本轮 tool_use 块交给执行引擎调度，结果回写 messages
-            run_tool_calls(res.content, messages, concurrent=CONCURRENT_TOOLS, max_workers=TOOL_MAX_WORKERS)
+            execute_tool_calls(
+                res.content,
+                messages,
+                concurrent=CONCURRENT_TOOLS,
+                max_workers=TOOL_MAX_WORKERS,
+            )
 
             # 与 Hermes 一致：guardrail halt 是一个明确的受控结束，不再额外调用模型总结。
             halt_decision = tool_guardrails.halt_decision
+            # 只允许第一次写入，后面即使工具调用成功，也无法修改
             if halt_decision is not None:
                 halt_text = f"工具调用已停止：{halt_decision.message}"
                 print(f"\n\033[33m⚠️  {halt_text}\033[0m")
@@ -166,6 +181,7 @@ def agent_loop(messages):
 
         # 正常完成和 guardrail 受控结束都已有最终 assistant 消息，直接返回。
         if exit_reason in {"completed", "guardrail_halt"}:
+            _append_file_mutation_notice(messages)
             tr.finish(exit_reason, api_call_count)
             return
 
@@ -183,6 +199,7 @@ def agent_loop(messages):
             timeout=API_TIMEOUT,
         )
         messages.append({"role": "assistant", "content": res.content})
+        _append_file_mutation_notice(messages)
         tr.finish(label, api_call_count)
 
     except KeyboardInterrupt:
@@ -213,11 +230,19 @@ if __name__ == "__main__":
     print("输入问题，回车发送。输入'q'、'exit'、''退出。")
     # 历史消息列表
     history = []
+    # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
+    prompt_session = (
+        PromptSession(history=InMemoryHistory()) if sys.stdin.isatty() else None
+    )
     # 持续接收用户输入
     while True:
         # 接收用户输入，并检查是否退出
         try:
-            query = input("\033[33m >> \033[0m")
+            if prompt_session is not None:
+                query = prompt_session.prompt(ANSI("\033[33m >> \033[0m"))
+            else:
+                # 管道输入不是交互终端，保留 input() 以支持脚本和 smoke test。
+                query = input("\033[33m >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             print("\n收到终止信号，退出交互")
             break

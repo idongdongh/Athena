@@ -36,18 +36,23 @@ class ToolRegistry:
     def register(self, name: str, schema: dict, handler: Callable, toolset: str = "default") -> None:
         self._tools[name] = ToolEntry(name, schema, handler, toolset)
 
-    # 获取指定工具的元数据
     def get_entry(self, name: str) -> Optional[ToolEntry]:
+        """获取指定工具的元数据。
+
+        Args:
+            name (str):工具名称
+
+        Returns:
+            Optional[ToolEntry]:工具（条目）元数据。
+        """
         return self._tools.get(name)
+
+    def names(self) -> List[str]:
+        """返回按名称排序的已注册工具列表。"""
+        return sorted(self._tools)
     
     def definitions(self) -> List[Any]:
-        """返回传给模型 API 的 tools schema 列表（Anthropic 原生格式）。
-
-        Anthropic SDK 的 ``messages.create(tools=...)`` 要求 ``Iterable[ToolUnionParam]``
-        （一个窄的 TypedDict 联合）；工具 schema 本质是 dict 子类型，但 Pyright 协变检查
-        下 ``List[dict]`` 无法静态证明满足 ``Iterable[ToolUnionParam]``。这里把元素声明为
-        ``Any``，让类型检查通过，运行时行为不变（仍是 list of dict）。
-        """
+        """返回传给模型 API 的 tools schema 列表（Anthropic 原生格式）。"""
         return [e.schema for e in self._tools.values()]
 
 
@@ -55,7 +60,7 @@ registry = ToolRegistry()
 
 
 def _module_registers_tools(path: Path) -> bool:
-    """静态判断模块顶层(AST的顶层）是否有 ``registry.register(...)`` 调用。
+    """模块是否注册了工具：静态判断模块顶层(AST的顶层）是否有 ``registry.register(...)`` 调用。
 
     同时检查包裹在顶层 ``if`` 块内的注册（如
     ``if registry is not None: registry.register(...)``），以便工具文件能在
@@ -67,6 +72,7 @@ def _module_registers_tools(path: Path) -> bool:
     except (OSError, SyntaxError):
         return False
 
+    # 检查 ast 顶层是否直接注册
     def _is_register_call(stmt) -> bool:
         return (
             isinstance(stmt, ast.Expr)
@@ -97,10 +103,6 @@ def discover(tools_dir: Optional[Path] = None) -> List[str]:
     loaded: List[str] = []
     # p 是工具脚本路径
     for p in sorted(d.glob("*.py")):
-        # 结构性身份冲突：这两个即便通过 AST 闸门也不该被 import
-        #   __init__: 包标识，import 无意义
-        #   registry : 本模块自身，import 会触发循环依赖
-        # 其他辅助模块（如 _path / _binary）由 AST 闸门过滤，无需进黑名单
         if p.stem in {"__init__", "registry"}:
             continue
         if not _module_registers_tools(p):
@@ -114,4 +116,3 @@ def discover(tools_dir: Optional[Path] = None) -> List[str]:
         except Exception as e:  # 单个工具模块损坏不应拖垮整个 agent
             print(f"[tools] 跳过 {p.stem}: {e}")
     return loaded
-

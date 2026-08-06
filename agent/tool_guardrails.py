@@ -1,40 +1,46 @@
 """工具调用重复检测控制器（per-turn 状态机）。
 
-对齐 hermes ``agent/tool_guardrails.py`` 的核心状态机，省略当前项目不需要的配置加载和观测字段：
-- ``ToolCallGuardrailConfig.from_mapping``（从 config.yaml 加载）——全部用默认值，YAGNI
-- Hermes 的 ``terminal`` 对应本项目的 ``bash``，保留 ``exit_code`` 失败分类
-- ``file_mutation_result_landed`` 白名单（file 写入成功不算失败的特判）——本项目无
-- ``_tool_failure_recovery_hint`` per-tool 提示文案——本项目无
-- metadata / observability 字段——本项目无 observability
+核心状态机参考 Hermes ``agent/tool_guardrails.py``。本项目通过环境变量控制
+warning 和 hard stop，不支持从 YAML 配置各项阈值。
 
-保留的核心（4 类重复检测）：
-- **精确失败重复**：同一 (name, args hash) 失败 N 次 → warn → block
-- **同工具失败重复**：同一 name（无论参数）失败 N 次 → warn → halt turn
-- **只读无进展**：只读工具 (name, args hash) 返回相同结果 N 次 → warn → block
-- **halt latch**：首次 halt 决策锁存，loop 顶部检查后整 turn 终止
+重复检测分为三类：
+- **精确失败重复**：同一工具、相同参数连续失败，先警告，达到上限后 block。在工具调用结果提示正确情况下，用来检测模型是否重复输出相同调用。
+- **同工具失败重复**：同一工具即使不断更换参数仍持续失败，达到上限后 halt。这个可以用来检测某个工具是否有问题。
+- **只读无进展**：相同只读调用反复返回相同结果，先警告，达到上限后 block。
 
-四级 action：``allow | warn | block | halt``
-- ``allow``：放行
-- ``warn``：放行 + 结果追加引导文本
-- ``block``：阻止，拒绝单次调用，返回 synthetic result（不执行 handler）
-- ``halt``：停止，标记 `_halt_decision`，loop 顶部见到后整 turn 退出
-block / halt 都会由控制器锁存到 ``halt_decision``，供主循环结束当前 turn。
+决策共有四种：
+- ``allow``：允许执行 handler。
+- ``warn``：允许执行 handler，并在工具结果中加入换策略提示。
+- ``block``：在执行前拦截当前调用，不执行 handler，改为返回 synthetic result。
+- ``halt``：在执行后发现同一工具累计失败过多，停止继续调用工具。
+
+``block`` 和 ``halt`` 的触发时机不同，但都会写入 ``halt_decision``：
+- ``block`` 发生在 ``before_call()``，拦住尚未执行的重复调用；
+- ``halt`` 发生在 ``after_call()``，此时当前调用已经执行完毕。
+
+主循环在每批工具调用处理完成后检查 ``halt_decision``。只要其中已有决策，
+就结束当前 turn。控制器只保留本 turn 内出现的第一个停止决策，并在下一条
+用户请求开始时重置。
+
+与 Hermes 完整实现相比，本项目未包含 ``ToolCallGuardrailConfig.from_mapping``、
+插件回调和独立观测存储；Hermes 的 ``terminal`` 工具在本项目中对应 ``bash``。
 """
 
 import hashlib
 import json
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from agent.tool_result_classification import classify_tool_result
+
 
 # ════════════════════════════════════════════════════════════════════════
-# 工具分类（IDEMPOTENT 只读 vs MUTATING 写）
+# 只读工具白名单
 # ════════════════════════════════════════════════════════════════════════
-# 两类工具的"重复"含义不同：
-# - 只读工具重复 = "数据不变你已读过了"（看结果 hash，不看失败次数）
-# - 写工具重复   = "持续失败整工具坏了"（看失败次数，不看结果 hash）
-# 这是 hermes 的核心设计：分类决定检测策略。
+# 名单内的工具会额外检测“相同参数反复返回相同结果”，用于识别无进展读取。
+# 名单外的工具不做结果 hash 比较，但工具调用失败仍会进入精确失败和同工具失败计数。
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
     "read_file",
@@ -44,14 +50,14 @@ IDEMPOTENT_TOOL_NAMES = frozenset({
 })
 
 # ════════════════════════════════════════════════════════════════════════
-# 配置（全部默认值，砍 config.yaml 加载）
+# 配置（保持精简，支持环境变量开关）
 # ════════════════════════════════════════════════════════════════════════
 # 阈值试验调出来的经验值。对齐 hermes ToolCallGuardrailConfig 默认。
 # warn 永远开（不阻断，只追加提示）；hard_stop 默认也开（CLI 阶段够用）。
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
-    """重复检测的 7 个阈值。全部默认值，不可配置（砍 from_mapping）。"""
+    """重复检测阈值。环境变量仅提供 warnings_enabled 和 hard_stop_enabled 两个开关，不引入完整 YAML 配置系统。"""
     warnings_enabled: bool = True
     hard_stop_enabled: bool = True          # 开启强制阻断模式，也就是默认开 block/halt
     exact_failure_warn_after: int = 2       # 在 2 次精确工具调用失败后触发 → warn
@@ -60,6 +66,20 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8   # 同 name 失败 8 次 → halt
     no_progress_warn_after: int = 2         # 只读无进展 2 次 → warn
     no_progress_block_after: int = 5        # 只读无进展 5 次 → block
+    invalid_tool_halt_after: int = 3        # 未知工具累计 3 次 → halt
+
+    @classmethod
+    def from_environment(cls) -> "ToolCallGuardrailConfig":
+        """加载 .env 中的配置，没配置就用默认
+
+        Returns:
+            ToolCallGuardrailConfig: ToolCallGuardrailConfig 类对象
+        """
+        defaults = cls()
+        return cls(
+            warnings_enabled=_env_bool("TOOL_GUARDRAIL_WARNINGS", defaults.warnings_enabled),
+            hard_stop_enabled=_env_bool("TOOL_GUARDRAIL_HARD_STOP", defaults.hard_stop_enabled),
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -68,12 +88,12 @@ class ToolCallGuardrailConfig:
 
 def _sha256(s: str) -> str:
     """稳定哈希（用于 args 规范化后压缩成指纹）。"""
-    # 使用 utg-8 先编码为字节流，然后使用 sha256 哈希算法编码，在转成 16 进制，最后取哈希值的前 16 位
+    # 使用 utf-8 先编码为字节流，然后使用 sha256 哈希算法编码，在转成 16 进制，最后取哈希值的前 16 位
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
-def _canonical_args(args: Mapping[str, Any]) -> str:
-    """args 系列化：转化为 json 字符串，（防 dict 顺序变化导致指纹不同）。"""
+def canonical_tool_args(args: Mapping[str, Any]) -> str:
+    """args 序列化：转化为 json 字符串，（防 dict 顺序变化导致指纹不同）。"""
     return json.dumps(
         dict(args or {}),
         ensure_ascii=False,  # 允许输出包含非 ASCII 字符（如中文），而不是转义成 \uXXXX 形式
@@ -85,78 +105,84 @@ def _canonical_args(args: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class ToolCallSignature:
-    """一次调用的稳定指纹：tool_name + args hash。
+    """一次工具调用的唯一标识。
 
-    dataclass(frozen=True) → 可哈希 → 可当 dict 的 key。
+    由工具名称和参数哈希组成，用于识别是否重复调用了同一个工具。
     """
     tool_name: str
     args_hash: str
 
     @classmethod
     def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
-        """初始化一个 ToolCallSignature 实例，并初始化好参数哈希值和工具名称"""
-        return cls(tool_name=tool_name, args_hash=_sha256(_canonical_args(args or {})))
+        """初始化一个 ToolCallSignature 类对象，并计算好参数哈希值和工具名称"""
+        return cls(tool_name=tool_name, args_hash=_sha256(canonical_tool_args(args or {})))
 
 
 @dataclass(frozen=True)
 class ToolGuardrailDecision:
-    """控制器返回的决策。"""
+    """护栏做出的处理决定。"""
     action: str = "allow"   # allow | warn | block | halt
-    code: str = "allow"     # 机器可读的决策码（如 repeated_exact_failure_block）
-    message: str = ""       # 给模型/用户的人读消息
+    code: str = "allow"     # 机器可读的决策码（如 repeated_exact_failure_block），代码可以据此判断
+    message: str = ""       # 人和模型可读的具体说明，解释发生了什么以及下一步怎么做。
     tool_name: str = ""
     count: int = 0
     signature: Optional[ToolCallSignature] = None
 
     @property
     def allows_execution(self) -> bool:
-        """True = 可以执行 handler（allow 或 warn）。"""
+        """判断 action 的值是否为 allow 或 warn。"""
         return self.action in {"allow", "warn"}
 
+    @property
+    def should_halt(self) -> bool:
+        """判断 action 的值是否为 block 或 halt。"""
+        return self.action in {"block", "halt"}
+
+    def to_metadata(self) -> dict[str, Any]:
+        """把内部的 ToolGuardrailDecision 对象转换成普通字典，方便记录、传输和序列化
+
+        Returns:
+            dict[str, Any]: 转化后的字典对象
+        """
+        data: dict[str, Any] = {
+            "action": self.action,
+            "code": self.code,
+            "message": self.message,
+            "tool_name": self.tool_name,
+            "count": self.count,
+        }
+        if self.signature is not None:
+            data["signature"] = {
+                "tool_name": self.signature.tool_name,
+                "args_hash": self.signature.args_hash,
+            }
+        return data
+
 # ════════════════════════════════════════════════════════════════════════
-# 失败分类（通用版，砍工具特化）
+# 失败分类（兼容入口）
 # ════════════════════════════════════════════════════════════════════════
-# 与 Hermes ``classify_tool_failure`` 保持同一契约：shell 工具看 exit_code，
-# 其他工具再使用结构化 error 和字符串启发式兜底。
+# 真正分类位于 ``tool_result_classification``；本函数保留为 Hermes 同签名兜底入口。
+def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+    """独立调用方的失败分类兜底。"""
+    outcome = classify_tool_result(tool_name, result)
+    if not outcome.counts_as_failure:
+        return False, ""
+    if outcome.exit_code is not None:
+        return True, f" [exit {outcome.exit_code}]"
+    return True, " [error]"
 
-def is_tool_failure(tool_name: str, result: str | None) -> bool:
-    """判断是否工具调用失败：通过判断工具调用结果中是否包含 error 和 failed 等来判断工具调用结果是否为失败。
 
-    Args:
-        tool_name: 工具名。
-        result: 工具返回字符串。
-
-    Returns:
-        True = 失败；False = 成功（含空结果——空不算失败）。
-
-    Note:
-        空结果（如 ``{"results": [], "count": 0}``）**不算失败**——工具执行成功了，
-        只是没数据。空结果归 ``_no_progress`` 检测管（只读工具无进展），不归这里。
-    """
-    if result is None:
-        return False
-    # 尝试解析 JSON，看是否有 "error" / "message" 字段
+def _result_hash(result: str | None) -> str:
+    """对 JSON 结果按语义哈希，避免字段顺序或空白变化绕过无进展检测。"""
+    raw = result or ""
     try:
-        data = json.loads(result) if isinstance(result, str) else None
-    except (json.JSONDecodeError, ValueError):
-        data = None
-
-    if isinstance(data, dict):
-        if tool_name == "bash":
-            exit_code = data.get("exit_code")
-            if exit_code is not None and exit_code != 0:
-                return True
-        err = data.get("error") or data.get("message")
-        if err and (data.get("success") is False or "error" in data):
-            return True
-
-    # 通用启发式：非 JSON 字符串以 "Error" 开头，或前 500 字含 '"error"' / '"failed"'
-    if isinstance(result, str):
-        lower = result[:500].lower()
-        if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
-            return True
-
-    return False
+        parsed = json.loads(raw)
+        canonical = json.dumps(
+            parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        canonical = raw
+    return _sha256(canonical)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -173,20 +199,26 @@ class ToolCallGuardrailController:
     """
 
     def __init__(self, config: Optional[ToolCallGuardrailConfig] = None):
+        """加载工具调用护栏配置，申请一个线程锁对象，重置不同方式工具调用失败次数（精准调用失败、相同工具名调用失败、只读工具无进展、终止工具调用的决策）
+
+        Args:
+            config (Optional[ToolCallGuardrailConfig], optional): ToolCallGuardrailConfig 对象，默认为 None
+        """
         self.config = config or ToolCallGuardrailConfig()
         self._halt_lock = threading.Lock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
-        """每个 turn 开头调用：清空 per-turn 计数器 + halt 锁存。"""
+        """重置不同方式工具调用失败次数。"""
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._invalid_tool_count = 0
         self._halt_decision: Optional[ToolGuardrailDecision] = None
 
     @property  # 把方法变成属性
     def halt_decision(self) -> Optional[ToolGuardrailDecision]:
-        """已锁存的 halt 决策（loop 顶部检查用）。"""
+        """已锁存（写入后无法修改）的 halt 决策（loop 顶部检查用）。"""
         with self._halt_lock:
             return self._halt_decision
 
@@ -201,18 +233,53 @@ class ToolCallGuardrailController:
             if self._halt_decision is None:
                 self._halt_decision = decision
 
+    def record_unknown_tool(self, tool_name: str) -> ToolGuardrailDecision:
+        """记录一次未知工具调用；连续猜测工具名达到阈值后终止本 turn。"""
+        self._invalid_tool_count += 1
+        count = self._invalid_tool_count
+        signature = ToolCallSignature.from_call(tool_name, {})
+
+        if self.config.hard_stop_enabled and count >= self.config.invalid_tool_halt_after:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="invalid_tool_halt",
+                message=(
+                    f"本 turn 已调用不存在的工具 {count} 次。"
+                    "停止猜测工具名称，只能从可用工具列表中选择。"
+                ),
+                tool_name=tool_name,
+                count=count,
+                signature=signature,
+            )
+            self._set_halt(decision)
+            return decision
+
+        if self.config.warnings_enabled:
+            return ToolGuardrailDecision(
+                action="warn",
+                code="invalid_tool_warning",
+                message=(
+                    f"{tool_name} 不是已注册工具（本 turn 第 {count} 次）。"
+                    "请从可用工具列表中选择，不要继续猜测工具名称。"
+                ),
+                tool_name=tool_name,
+                count=count,
+                signature=signature,
+            )
+
+        return ToolGuardrailDecision(tool_name=tool_name, count=count, signature=signature)
+
     # ── before_call：执行前检查 ───────────────────────────────────────────
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        """工具执行前调用：判是否阻断（精确失败 / 只读无进展 达阈值）。
+        """工具执行前调用：判断精确失败 / 只读无进展是否达到阈值。
 
         Returns:
-            ToolGuardrailDecision。allows_execution=False 时调用方应跳过 handler，
-            返回 synthetic result；block/halt 会由控制器自动锁存。
+            ToolGuardrailDecision 类对象。
         """
         signature = ToolCallSignature.from_call(tool_name, args)
+        # 工具护栏的配置
         cfg = self.config
 
-        # 如果没有配置就使用默认配置，现在只有默认配置，配置加载系统还没实现
         if not cfg.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -270,13 +337,13 @@ class ToolCallGuardrailController:
             failed: 显式失败标志（推荐传入，避免重复分类）；None 时用 classify_tool_failure。
 
         Returns:
-            ToolGuardrailDecision。warn/block/halt 意味着计数已达阈值。
+            ToolGuardrailDecision。
         """
         signature = ToolCallSignature.from_call(tool_name, args)
         cfg = self.config
 
         if failed is None:
-            failed = is_tool_failure(tool_name, result)
+            failed, _ = classify_tool_failure(tool_name, result)
 
         if failed:
             # 精确失败 +1；清无进展记录（失败时不应该计无进展）
@@ -323,10 +390,7 @@ class ToolCallGuardrailController:
                 return ToolGuardrailDecision(
                     action="warn",
                     code="same_tool_failure_warning",
-                    message=(
-                        f"{tool_name} 本 turn 内失败 {same_count} 次。"
-                        "换路径或换工具。"
-                    ),
+                message=_tool_failure_recovery_hint(tool_name, same_count),
                     tool_name=tool_name,
                     count=same_count,
                     signature=signature,
@@ -334,7 +398,7 @@ class ToolCallGuardrailController:
 
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
-        # Hermes 语义：成功会终止对应调用和工具的连续失败计数。
+        # 工具调用成功会终止对应工具的连续失败计数。
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
@@ -343,7 +407,7 @@ class ToolCallGuardrailController:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         # 只读成功路径：记录结果 hash，供下次 before_call 判"只读无进展"
-        result_hash = _sha256(result or "")
+        result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         if previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
@@ -371,21 +435,37 @@ class ToolCallGuardrailController:
 # ════════════════════════════════════════════════════════════════════════
 # 工具函数：合成 blocked result + 追加 warning 后缀
 # ════════════════════════════════════════════════════════════════════════
-# 对应 hermes ``_guardrail_block_result`` + ``append_toolguard_guidance``。
 
+    """ 预检时调用 before_call 后，decision 中 action 字段不为 warn 或者 allow 时，合成假的工具调用 result 字符串（替代真执行）。
+
+    合成规则：
+    1. "error": decision.message,
+    2. "guardrail": decision.to_metadata(),
+    3. "blocked": True,
+
+    """
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
-    """合成 blocked/halt 调用的假 result 字符串（替代真执行）。
+    """ 预检时调用 before_call 后，decision 的 action 字段为 block 时，合成假的工具调用 result 字符串（替代真执行）。
 
-    调用方在 allows_execution=False 时用这个替代真 handler 返回值。
+    合成规则：
+    1. "error": decision.message,
+    2. "guardrail": decision.to_metadata(),
+    3. "blocked": True,
+
+    Args:
+        decision (ToolGuardrailDecision): 工具护栏决策
+
+    Returns:
+        str: json 字符串
     """
     return json.dumps({
         "error": decision.message,
-        "guardrail": decision.code,
+        "guardrail": decision.to_metadata(),
         "blocked": True,
     }, ensure_ascii=False)
 
 
-def append_guardrail_guidance(result: str, decision: ToolGuardrailDecision) -> str:
+def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
     """warn/halt 决策时，把引导文本追加到 result 末尾给模型看。
 
     action=warn：追加后缀，放行执行（result 已是真结果）
@@ -394,5 +474,43 @@ def append_guardrail_guidance(result: str, decision: ToolGuardrailDecision) -> s
     label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
     suffix = f"\n\n[{label}: {decision.code}; count={decision.count}; {decision.message}]"
     if result is None:
+        # .lstrip：删除空白符号、换行符号、制表符
         return suffix.lstrip()
     return result + suffix
+
+
+def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
+    """为重复失败提供可执行的下一步，而不只是要求模型“重试”。"""
+    common = (
+        f"{tool_name} 本 turn 内失败 {count} 次。先检查最新错误和假设，"
+        "不要原样重试。"
+    )
+    if tool_name == "bash":
+        return common + "可先用 pwd && ls -la 诊断，再尝试绝对路径、更小的命令或文件工具。"
+    if tool_name in {"read_file", "search_files", "write_file", "patch"}:
+        return common + "请重新读取目标，确认路径和当前文本，缩小查询或修改范围。"
+    if tool_name in {"web_search", "web_extract"}:
+        return common + "请缩小关键词、更换查询或使用已获得的结果。"
+    return common + "请改用不同参数、更窄的查询或其他工具。"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """解析 .env 中配置的环境变量，真值：{"1", "true", "yes", "on", "enabled"}，都会被解析成 True
+    假值：{"0", "false", "no", "off", "disabled"}，被解析成 false
+
+    Args:
+        name (str): 待解析的环境变量名称
+        default (bool): 默认值
+
+    Returns:
+        bool: True/False
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default

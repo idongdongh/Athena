@@ -58,8 +58,17 @@ class Tracer:
     def tool_call(self, name, args):
         self._emit("tool_call", name=name, args=_truncate(json.dumps(args, ensure_ascii=False)))
 
-    def tool_result(self, name, output):
-        self._emit("tool_result", name=name, output=_truncate(output))
+    def tool_result(self, name, output, outcome=None):
+        """记录工具结果；若提供统一 outcome，同步保存分类后的状态。"""
+        data = {"name": name, "output": _truncate(str(output))}
+        if outcome is not None:
+            data.update(
+                status=outcome.status,
+                error_code=outcome.error_code,
+                error_message=_truncate(outcome.error_message) if outcome.error_message else None,
+                exit_code=outcome.exit_code,
+            )
+        self._emit("tool_result", **data)
 
     def finish(self, reason, total_steps):
         self._emit("finish", reason=reason, total_steps=total_steps)

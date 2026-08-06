@@ -48,3 +48,5 @@ notebook/
 .idea/
 .vscode/
 *.swp
+
+all_dataclass.py
