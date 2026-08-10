@@ -81,14 +81,14 @@ MAX_TOKENS_SUMMARY = int(os.getenv("MAX_TOKENS_SUMMARY", "4096"))
 # 每个出口只赋 TurnOutcome，最终的"是否再走一次 summary 调用"由
 # outcome.needs_summary 单一判断，避免字符串白名单漏改。
 class TurnOutcome(Enum):
-    """agent_loop 一次 turn 的结束方式。"""
+    """枚举类型：一次 turn 的结束方式。"""
 
     COMPLETED = "completed"                       # 模型自然 end_turn
     INTERRUPTED = "interrupted"                   # 用户 Ctrl+C
     GUARDRAIL_HALT = "guardrail_halt"             # guardrail 触发 halt
-    POST_TOOL_EMPTY = "post_tool_empty_response"  # 工具后空回复连续两次
-    INVALID_TOOL_LIMIT = "invalid_tool_limit"     # 未知工具连续 3 轮
-    ITERATION_BUDGET_EXHAUSTED = "iter_budget"    # 达到 MAX_ITERATIONS
+    POST_TOOL_EMPTY = "post_tool_empty_response"  # 调用工具后空回复连续两次
+    INVALID_TOOL_LIMIT = "invalid_tool_limit"     # 模型调用未知工具连续 3 轮
+    ITERATION_BUDGET_EXHAUSTED = "iter_budget"    # 达到 MAX_ITERATIONS，需要总结
 
     @property
     def needs_summary(self) -> bool:
@@ -104,7 +104,7 @@ FORCE_QUIT_WINDOW_SECONDS = 2.0
 # signum：信号编号，不同编号对应不同的中断机制
 # frame：栈帧，当前程序执行的快照
 def _on_interrupt(signum, frame):
-    """第一次 Ctrl+C 暂停当前任务；两秒内再次按下则退出程序。"""
+    """第一次 Ctrl+C 调用这个函数打开线程之间的信号开关（告诉线程某个事件发生了），两秒内第二次 ctrl+c 抛出 KeyboardInterrupt。"""
     global _last_interrupt_time
     now = time.monotonic()
     if interrupt_controller.is_requested():
@@ -119,6 +119,7 @@ def _on_interrupt(signum, frame):
             "press Ctrl+C again within 2 seconds to quit.\033[0m"
         )
         return
+    # 打开信号开关
     interrupt_controller.request()
     _last_interrupt_time = now
     print(
@@ -129,17 +130,23 @@ def _on_interrupt(signum, frame):
 
 def _handle_idle_ctrl_c(event) -> None:
     """空闲 REPL 中，优先清空已有输入；空输入框才退出。"""
+    # event：事件对象；event.app：当前应用对象
     buffer = event.app.current_buffer
     if buffer.text:
+        # 清空输入缓冲区
         buffer.reset()
+        # 请求刷新中断界面，因为内容已经清空
         event.app.invalidate()
         return
     event.app.exit(exception=KeyboardInterrupt)
 
 
 def _create_repl_key_bindings() -> KeyBindings:
-    """创建 REPL 按键绑定；运行中的 Ctrl+C 仍由 SIGINT handler 处理。"""
+    """创建 REPL 按键绑定：将 ctrl+c 与 _handle_idle_ctrl_c 函数绑定
+    _handle_idle_ctrl_c（处理空闲状态在 ctrl+c，就是用户输入状态）：优先清空已有输入；空输入框才退出
+    """
     bindings = KeyBindings()
+    # 创建快捷键并绑定回调函数
     bindings.add("c-c")(_handle_idle_ctrl_c)
     return bindings
 
@@ -249,7 +256,7 @@ class _StreamWorker:
     通过同一个 signal 知道自己已被取消但仍会跑完资源清理。
 
     锁、cancel signal、worker thread 都收到内部——外部只通过 6 个动作驱动：
-      - start()           启动 daemon worker
+      - start()           启动 daemon worker（后台工作线程）
       - poll(0.05)         轮询是否已结束
       - request_cancel()  锁存本次请求已取消
       - close_active()    主动关闭当前 stream，唤醒阻塞在迭代里的 worker
@@ -257,7 +264,9 @@ class _StreamWorker:
       - finalize()        取出 (response, error, partial_text, emitted_text)
     """
 
+    # 轮询间隔
     POLL_INTERVAL = 0.05
+    # 取消后清空
     POST_CANCEL_DRAIN = 0.5
 
     def __init__(self, stream_method, stream_kwargs, on_text, on_retry):
@@ -269,8 +278,8 @@ class _StreamWorker:
             "stream": None,
             "response": None,
             "error": None,
-            "text_parts": [],
-            "emitted_text": False,
+            "text_parts": [], # 模型回复的文本
+            "emitted_text": False, # 模型是否已经输出文本
         }
         self._stream_method = stream_method
         self._stream_kwargs = stream_kwargs
@@ -288,11 +297,13 @@ class _StreamWorker:
             def open_stream():
                 # Provider 的 stream 创建和 __enter__ 可能阻塞网络，不能持有
                 # 状态锁；否则主线程中断时 close_active() 会卡在等同一把锁。
+                # self._stream_method(**self._stream_kwargs)就是调用流式接口client.messages.stream
                 candidate_manager = self._stream_method(**self._stream_kwargs)
                 candidate_stream = candidate_manager.__enter__()
                 with self._state_lock:
                     self._state["manager"] = candidate_manager
                     self._state["stream"] = candidate_stream
+                # MessageStreamManager 对象，MessageStream 对象
                 return candidate_manager, candidate_stream
 
             manager, stream = request_with_retries(
@@ -321,6 +332,7 @@ class _StreamWorker:
                         if self._on_text is not None:
                             self._on_text(delta)
             if not self._is_cancelled():
+                # 获取 ParsedMessage 对象：类似 create 接口返回的内容，但是对象类型不同
                 self._state["response"] = stream.get_final_message()
         except (ProviderRequestFailed, ProviderRequestInterrupted) as exc:
             self._state["error"] = exc
@@ -344,7 +356,7 @@ class _StreamWorker:
             self._finished.set()
 
     def start(self) -> None:
-        """启动 daemon worker。"""
+        """创建一个后台线程对象并启动这个 daemon worker。"""
         threading.Thread(target=self._consume_stream, name="model-stream", daemon=True).start()
 
     def poll(self, timeout: float) -> bool:
@@ -390,20 +402,27 @@ def _stream_message_with_recovery(
     测试 fake client 若没有 ``messages.stream``，自动回退到普通 create 接口。
     流建立前的错误沿用 Provider 重试；流已经开始后不自动重放，避免重复输出。
     """
+    # 尝试获取 Messages 对象下面的 stream 方法，最常用的是 create 方法
+    # 兼容不支持 .stream() 的客户端实现和兼容测试里的 fake client
+    # 调用链路：有可用的 stream 就用，没有就用 create 方法
     stream_method = getattr(client.messages, "stream", None)
     if not callable(stream_method):
         return _create_message_with_recovery(**kwargs), False
 
+    # 复制字典，原来的 kwargs 并没有被替换
     stream_kwargs = dict(kwargs)
     request_timeout = stream_kwargs.pop("timeout", None)
+    # 取 client 下面的 with_options 方法 = copy 方法的别名：作用是创建一个新的客户端实例，复用当前客户端所使用的全部配置项，并支持选择性覆盖部分配置（通过关键字传入新的值）
     with_options = getattr(client, "with_options", None)
     if request_timeout is not None and callable(with_options):
+        # 新客户端带有原来客户端的参数
         stream_client = with_options(timeout=request_timeout)
         stream_method = stream_client.messages.stream
 
     worker = _StreamWorker(stream_method, stream_kwargs, on_text, _on_retry)
     worker.start()
 
+    # 轮询检查中断状态
     while not worker.poll(_StreamWorker.POLL_INTERVAL):
         if not interrupt_controller.is_requested():
             continue
@@ -484,6 +503,7 @@ def _request_summary(messages, *, stream_output: bool) -> None:
         ),
         max_tokens=MAX_TOKENS_SUMMARY,
         timeout=API_TIMEOUT,
+        # 打印流式输出
         on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
     )
     messages.append({"role": "assistant", "content": res.content})
@@ -501,7 +521,7 @@ def agent_loop(messages, *, stream_output: bool = False):
     # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
     tr = reset_tracer()
 
-    # 仅在模型执行期间接管 Ctrl+C；结束后恢复进入函数前的 handler。
+    # 仅在 loop 执行期间接管 Ctrl+C；结束后恢复进入 loop 前的 handler。
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, _on_interrupt)
 
@@ -698,21 +718,22 @@ def agent_loop(messages, *, stream_output: bool = False):
 
 
 if __name__ == "__main__":
-    print("输入问题，回车发送。输入'q'、'exit'、''退出。")
     # 历史消息列表
     history = []
     # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
     prompt_session = (
         PromptSession(
+            # 用于实现命令历史记录功能
             history=InMemoryHistory(),
+            # 一次 ctrl+c 清空内容，两次退出程序
             key_bindings=_create_repl_key_bindings(),
         )
+        # 判断程序的标准输入流式是否是终端
         if sys.stdin.isatty()
         else None
     )
-    # 持续接收用户输入
+    # REPL：交互式循环
     while True:
-        # REPL 是统一退出边界：既处理空闲输入时的 Ctrl+C，也接住任务运行期间
         # 第二次 Ctrl+C 抛出的 KeyboardInterrupt。
         try:
             if prompt_session is not None:
@@ -720,13 +741,14 @@ if __name__ == "__main__":
             else:
                 # 管道输入不是交互终端，保留 input() 以支持脚本和 smoke test。
                 query = input("\033[33m >> \033[0m")
-            if query.strip().lower() in ("q", "exit", ""):
-                break
 
             # 将用户 query 追加到历史消息列表中
             history.append({"role": "user", "content": query})
 
             agent_loop(history, stream_output=True)
-        except (EOFError, KeyboardInterrupt):
-            print("\n收到终止信号，退出交互")
+        except EOFError:
+            print("\n输入结束，退出交互")
+            break
+        except KeyboardInterrupt:
+            print("\n收到 Ctrl+C，退出交互")
             break

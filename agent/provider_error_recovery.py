@@ -134,6 +134,7 @@ def _interruptible_wait(
     is_interrupted: Callable[[], bool],
     sleep: Callable[[float], None],
 ) -> None:
+    """每隔 0.2 秒检查一次用户是否中断"""
     if is_interrupted():
         raise ProviderRequestInterrupted("Provider retry interrupted")
     remaining = max(seconds, 0.0)

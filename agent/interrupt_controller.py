@@ -5,8 +5,6 @@
 agent 实例持有独立控制器。
 """
 
-from __future__ import annotations
-
 import threading
 from typing import Callable, TypeVar
 
@@ -22,18 +20,19 @@ class InterruptController:
     """基于 ``threading.Event`` 的协作式中断控制器。"""
 
     def __init__(self) -> None:
+        """初始化一个线程事件对象，一个供线程共享的、线程安全的布尔信号开关，用来告诉其他线程某个事件发生了"""
         self._event = threading.Event()
 
     def request(self) -> None:
-        """请求当前 agent turn 尽快停止。"""
+        """发出信号即请求当前 agent turn 尽快停止。"""
         self._event.set()
 
     def clear(self) -> None:
-        """清除上一轮中断，供下一轮安全复用。"""
+        """清除信号即清除上一轮中断，供下一轮安全复用。"""
         self._event.clear()
 
     def is_requested(self) -> bool:
-        """当前 turn 是否已收到中断请求。"""
+        """判断信号是否发送即当前 turn 是否已收到中断请求。"""
         return self._event.is_set()
 
     def wait(self, timeout: float | None = None) -> bool:
