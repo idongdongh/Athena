@@ -27,7 +27,7 @@ messages.append(tool_result(result))
 - 用户按下 Ctrl+C：这是取消，不应该算工具质量差或模型重试失败。
 
 **根本问题**：工具结果只有内容，没有明确状态。只要失败语义依赖字符串猜测，后面的
-重试、护栏、trace 和最终回答就会各自做一套判断，并逐渐互相矛盾。
+重试、护栏、文件核验和最终回答就会各自做一套判断，并逐渐互相矛盾。
 
 ---
 
@@ -36,9 +36,9 @@ messages.append(tool_result(result))
 ### 问题 1.1：不同消费者对“失败”的理解不一致
 
 例如 bash 最权威的失败信号是非零退出码；文件工具通常返回 `error` 字段；普通文本工具
-可能只能使用错误前缀兜底。如果 guardrail、trace 和文件修改检查分别解析一次，很容易出现：
+可能只能使用错误前缀兜底。如果 guardrail 和文件修改检查分别解析一次，很容易出现：
 
-- trace 记录成功，guardrail 却计作失败；
+- 文件核验认为成功，guardrail 却计作失败；
 - `success=true, error=null` 因为包含单词 `error` 被误判；
 - 网页结果列表中某一项包含 `error` 字段，整个工具调用被误判失败；
 - 成功但没有 stdout 的 bash 被误认为失败。
@@ -66,7 +66,6 @@ classify_tool_result
 ToolOutcome
     ├─ guardrail 是否累计失败
     ├─ file mutation 是否真正落盘
-    ├─ trace 记录状态和错误码
     └─ tool_result 返回给模型
 ```
 
@@ -83,7 +82,7 @@ ToolOutcome
 
 ### 新的不变量
 
-> 一次工具调用只分类一次；guardrail、trace、文件核验共享同一个结论。
+> 一次工具调用只分类一次；guardrail、文件核验共享同一个结论。
 
 ---
 
@@ -247,13 +246,13 @@ value = (result_hash, repeat_count)
 - 计数顺序可能不稳定；
 - 第 N 次调用不一定看得到前 N-1 次的结果；
 - 返回给模型的结果顺序可能与 tool_use 顺序不一致；
-- 写失败跟踪和 trace 也会出现竞态。
+- 写失败跟踪也会出现竞态。
 
 ### 解 5.1：worker 无状态，主线程按模型顺序归并
 
 ```text
 worker：只运行 handler → RawToolExecution
-主线程：分类 → after_call → mutation tracker → trace → tool_result
+主线程：分类 → after_call → mutation tracker → tool_result
 ```
 
 并发规则进一步收紧为：
@@ -375,7 +374,6 @@ handler
     ├─ after_call 更新重复失败/无进展状态
     ├─ warn/halt guidance 写入结果
     ├─ FileMutationTracker 更新未恢复写失败
-    ├─ trace 记录
     └─ 生成一一对应的 tool_result
     ↓
 conversation loop

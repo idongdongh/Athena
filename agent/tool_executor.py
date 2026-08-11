@@ -1,7 +1,7 @@
 """工具执行与结果归并。
 
 handler 可以并发运行，但所有共享状态都由主线程按模型原始调用顺序归并：
-结果分类、guardrail、文件修改核验、trace 和对话消息因此保持确定性。
+结果分类、guardrail、文件修改核验和对话消息因此保持确定性。
 """
 
 from __future__ import annotations
@@ -33,10 +33,10 @@ from agent.tool_result_classification import (
     ToolOutcome,
     classify_tool_result,
 )
-from agent.tracer import get_tracer
 from tools._permission import check_tool_permission
 from tools.registry import registry
 
+# 单次工具调用批次返回给模型的所有工具结果，最多允许占用 300,000 个字符
 TURN_BUDGET_CHARS = 300_000
 
 # 每条用户请求开始时由 conversation_loop 重置状态；配置在进程启动时读取一次。
@@ -284,15 +284,14 @@ def _classify_raw_execution(name: str, raw: RawToolExecution) -> ToolOutcome:
 def dispatch_tool_call(name: str, args: dict) -> str:
     """兼容旧调用方的单工具执行入口。
 
-    与批量路径使用同一契约：记录调用、执行 preflight、更新
-    guardrail / 文件状态 / trace，防止兼容调用方绕过权限边界。
+    与批量路径使用同一契约：执行 preflight、更新 guardrail / 文件状态，
+    防止兼容调用方绕过权限边界。
     """
     try:
         args = coerce_tool_args(name, args)
     except (TypeError, ValueError, OverflowError) as exc:
         outcome = _invalid_arguments_outcome(name, exc)
         return _finalize_outcome(outcome, {}).content
-    get_tracer().tool_call(name, args)
     outcome = _preflight_call(name, args)
     if outcome is None:
         outcome = _classify_raw_execution(name, _execute_raw_tool_call(name, args))
@@ -401,7 +400,6 @@ def _finalize_outcome(outcome: ToolOutcome, args: dict) -> ToolOutcome:
         )
 
     file_mutation_tracker.record(outcome, args)
-    get_tracer().tool_result(outcome.tool_name, outcome.content, outcome=outcome)
     return outcome
 
 
@@ -492,7 +490,6 @@ def _run_sequential(
     """
     outcomes: list[ToolOutcome] = []
     for call, args, prep_err in zip(calls, prepared_args, preparation_errors):
-        get_tracer().tool_call(call.name, args)
         outcome = _run_one_or_cancelled(call, args, prep_err, is_cancelled)
         outcomes.append(_finalize_outcome(outcome, args))
     return outcomes
@@ -507,15 +504,14 @@ def _run_parallel(
 ) -> list[ToolOutcome]:
     """并发执行：批量 preflight 后用 ThreadPoolExecutor 跑 handler，最后主线程顺序 finalize。
 
-    所有 stateful 操作（guardrail、file_mutation_tracker、trace）都在主线程按模型原
-    始调用顺序归并——worker 只跑 handler，不触碰共享状态。
+    所有 stateful 操作（guardrail、file_mutation_tracker）都在主线程按模型原始
+    调用顺序归并——worker 只跑 handler，不触碰共享状态。
     """
     raw_outcomes: list[RawToolExecution | ToolOutcome | None] = [None] * len(calls)
     executable: list[tuple[int, Any, dict]] = []
     for index, (call, args, prep_err) in enumerate(
         zip(calls, prepared_args, preparation_errors)
     ):
-        get_tracer().tool_call(call.name, args)
         if is_cancelled():
             raw_outcomes[index] = _cancelled_outcome(
                 call.name, "not started due to user interrupt"

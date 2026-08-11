@@ -10,6 +10,7 @@ from typing import Any, Callable
 from anthropic import Anthropic
 from anthropic.types import TextBlock, ToolUseBlock
 from dotenv import load_dotenv
+from httpx import Timeout
 
 # 用于实现更好的命令行输入框
 from prompt_toolkit import PromptSession
@@ -18,7 +19,16 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 
 from tools.registry import registry, discover
+from agent.config_loader import load_config
+from agent.context_compressor import ContextCompressor
+from agent.context_state import (
+    ContextSettings,
+    ContextState,
+    estimate_request_tokens_rough,
+)
+from agent.conversation_compression import compress_context
 from agent.interrupt_controller import interrupt_controller
+from agent.model_response import ModelStopReason, inspect_model_response
 from agent.provider_error_recovery import (
     ProviderRequestFailed,
     ProviderRequestInterrupted,
@@ -26,7 +36,6 @@ from agent.provider_error_recovery import (
     request_with_retries,
 )
 from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
-from agent.tracer import reset_tracer, get_tracer
 
 load_dotenv(override=True)
 
@@ -43,9 +52,22 @@ if not _model_id:
         "MODEL_ID 未设置。请在项目根 .env 配置后重试。"
     )
 
+# 发送请求、等待/读取响应：最多 300 秒
+API_TIMEOUT = 300.0
+# 建立连接：最多 10 秒
+API_CONNECT_TIMEOUT = 10.0
+
 # 重试统一由 provider_error_recovery 管理，避免 SDK 内置重试与外层重试相乘。
-client = Anthropic(base_url=os.getenv("BASE_URL"), api_key=_api_key, max_retries=0)
+client = Anthropic(
+    base_url=os.getenv("BASE_URL"),
+    api_key=_api_key,
+    max_retries=0,
+    timeout=Timeout(timeout=API_TIMEOUT, connect=API_CONNECT_TIMEOUT),
+)
 MODEL_ID = _model_id
+_project_config = load_config()
+# 基于配置初始化一个 ContextSettings 对象
+CONTEXT_SETTINGS = ContextSettings.from_mapping(_project_config)
 
 
 def _build_system() -> str:
@@ -64,16 +86,22 @@ def _build_system() -> str:
 SYSTEM = _build_system()
 # 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾
 MAX_ITERATIONS = 90
-# API 调用超时（秒）：防止网络层面无限期阻塞
-API_TIMEOUT = 300.0
 # 工具并发执行：仅工具名互不重复的只读调用会并行；bash、写操作和重复调用顺序执行。
 CONCURRENT_TOOLS = True
 # 并发线程池上限
 TOOL_MAX_WORKERS = 4
-# 单轮 API 输出 token 上限：tool_use 块本就小，1024 够；summary 轮要产长文本，
-# 允许 .env 覆盖（MAX_TOKENS_SUMMARY=8192）。
-MAX_TOKENS_TOOL = 1024
-MAX_TOKENS_SUMMARY = int(os.getenv("MAX_TOKENS_SUMMARY", "4096"))
+# 模型输出与上下文参数统一来自 config.yaml；缺失或非法字段使用代码默认值。
+MAX_OUTPUT_TOKENS = CONTEXT_SETTINGS.max_output_tokens
+MAX_TOKENS_SUMMARY = CONTEXT_SETTINGS.max_output_tokens
+MAX_LENGTH_CONTINUATIONS = CONTEXT_SETTINGS.max_length_continuations
+CONTEXT_WINDOW = CONTEXT_SETTINGS.context_window
+COMPRESSION_ENABLED = CONTEXT_SETTINGS.compression_enabled
+MAX_COMPRESSIONS_PER_TURN = CONTEXT_SETTINGS.max_compressions_per_turn
+
+_LENGTH_CONTINUATION_PROMPT = (
+    "Continue exactly where the previous response stopped. Do not repeat earlier text. "
+    "Return plain text only and do not call tools."
+)
 
 
 # ---- agent_loop 的单点收尾 ----
@@ -89,6 +117,9 @@ class TurnOutcome(Enum):
     POST_TOOL_EMPTY = "post_tool_empty_response"  # 调用工具后空回复连续两次
     INVALID_TOOL_LIMIT = "invalid_tool_limit"     # 模型调用未知工具连续 3 轮
     ITERATION_BUDGET_EXHAUSTED = "iter_budget"    # 达到 MAX_ITERATIONS，需要总结
+    OUTPUT_TRUNCATED = "output_truncated"         # 输出达到 max_tokens 且补救耗尽
+    MODEL_REFUSED = "model_refused"               # Provider 正常返回拒绝状态
+    UNSUPPORTED_STOP_REASON = "unsupported_stop"  # 未识别或当前不支持的停止原因
 
     @property
     def needs_summary(self) -> bool:
@@ -155,27 +186,14 @@ def _create_repl_key_bindings() -> KeyBindings:
 discover()
 
 
-def _last_user_text(messages):
-    """提取最近一条 user 消息的纯文本，用于 trace 记录 query。"""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            c = m.get("content")
-            if isinstance(c, str):
-                return c
-            if isinstance(c, list):
-                return "".join(b.get("text", "") for b in c
-                    if isinstance(b, dict) and b.get("type") == "text")
-    return None
-
-
 def _assistant_text(res):
-    """提取模型本轮回复里的文本块，用于 trace 记录。"""
+    """提取模型本轮回复里的文本块中的 text 并用 "" 拼接。"""
     return "".join(getattr(b, "text", "") for b in res.content
                    if getattr(b, "type", None) == "text")
 
 
 def _is_empty_model_response(res) -> bool:
-    """模型响应是否既没有工具调用，也没有非空文本。"""
+    """模型响应没有工具调用 block 且 text block 中的 text 内容为空。"""
     has_tool_call = any(isinstance(block, ToolUseBlock) for block in res.content)
     return not has_tool_call and not _assistant_text(res).strip()
 
@@ -184,7 +202,7 @@ def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
     """发现未知工具时返回整批 synthetic results：
     1. 工具名为空："Tool call rejected: the tool name was empty. Use a valid name from the available tool list."
     2. 工具名不在可调用名单中：Unknown tool: {工具名称}. Available tools: {可用工具清单：工具1， 工具2， ....}
-    3. 工具存在："Skipped: another tool call in this batch used an invalid name. Please retry this tool call."
+    3. 工具存在但这批次存在未知工具："Skipped: another tool call in this batch used an invalid name. Please retry this tool call."
 
     本批调用工具全部存在时返回 None。"""
     invalid_names = {call.name for call in tool_calls if registry.get_entry(call.name) is None}
@@ -229,22 +247,10 @@ def _append_file_mutation_notice(messages) -> str:
 
 
 def _on_retry(error, retry_number, wait_seconds):
-    """打印 Provider 重试提示（_create_message_with_recovery / _stream_message_with_recovery 共用）。"""
+    """打印 Provider 重试提示。"""
     print(
         f"\033[33m⚠️  API {error.kind}，{wait_seconds:.1f} 秒后重试 "
         f"（{retry_number}/3）\033[0m"
-    )
-
-
-def _create_message_with_recovery(**kwargs):
-    """调用模型 Provider，并对暂时性错误执行有界重试。"""
-    return request_with_retries(
-        lambda: client.messages.create(**kwargs),
-        max_retries=3,
-        # 这里为什么不直接传变量本身，如果传变量本身，那么 is_interrupted 的值就固定下来，
-        # 如果用户在重试的过程中按了 ctrl+c，is_interrupted 值不会变
-        is_interrupted=interrupt_controller.is_requested,
-        on_retry=_on_retry,
     )
 
 
@@ -272,7 +278,7 @@ class _StreamWorker:
     def __init__(self, stream_method, stream_kwargs, on_text, on_retry):
         self._state_lock = threading.Lock()
         self._finished = threading.Event()
-        self._request_cancelled = threading.Event()
+        self._request_cancelled = threading.Event() # 表示本次流式请求是否已被取消
         self._state = {
             "manager": None,
             "stream": None,
@@ -287,16 +293,14 @@ class _StreamWorker:
         self._on_retry = on_retry
 
     def _is_cancelled(self) -> bool:
-        # request_cancelled 是本次请求的锁存信号：agent_loop 返回后会清除全局
-        # controller，但遗留 worker 仍必须知道自己已经被取消。
+        """检查流式请求信号和中断信号是否已触发"""
+        # _request_cancelled 是本次请求的锁存信号：一旦设置为 True，在这次对象的生命周期里就保持 True，不会自动恢复
         return self._request_cancelled.is_set() or interrupt_controller.is_requested()
 
     def _consume_stream(self) -> None:
         manager = None
         try:
             def open_stream():
-                # Provider 的 stream 创建和 __enter__ 可能阻塞网络，不能持有
-                # 状态锁；否则主线程中断时 close_active() 会卡在等同一把锁。
                 # self._stream_method(**self._stream_kwargs)就是调用流式接口client.messages.stream
                 candidate_manager = self._stream_method(**self._stream_kwargs)
                 candidate_stream = candidate_manager.__enter__()
@@ -360,7 +364,7 @@ class _StreamWorker:
         threading.Thread(target=self._consume_stream, name="model-stream", daemon=True).start()
 
     def poll(self, timeout: float) -> bool:
-        """等待 worker 完成；返回 True 表示已结束。"""
+        """等待 _finished 信号 timeout 秒；返回 True 表示已结束。"""
         return self._finished.wait(timeout)
 
     def request_cancel(self) -> None:
@@ -399,27 +403,9 @@ def _stream_message_with_recovery(
 ):
     """流式请求模型；中断时返回已生成的文本，不保留未完成的工具调用。
 
-    测试 fake client 若没有 ``messages.stream``，自动回退到普通 create 接口。
     流建立前的错误沿用 Provider 重试；流已经开始后不自动重放，避免重复输出。
     """
-    # 尝试获取 Messages 对象下面的 stream 方法，最常用的是 create 方法
-    # 兼容不支持 .stream() 的客户端实现和兼容测试里的 fake client
-    # 调用链路：有可用的 stream 就用，没有就用 create 方法
-    stream_method = getattr(client.messages, "stream", None)
-    if not callable(stream_method):
-        return _create_message_with_recovery(**kwargs), False
-
-    # 复制字典，原来的 kwargs 并没有被替换
-    stream_kwargs = dict(kwargs)
-    request_timeout = stream_kwargs.pop("timeout", None)
-    # 取 client 下面的 with_options 方法 = copy 方法的别名：作用是创建一个新的客户端实例，复用当前客户端所使用的全部配置项，并支持选择性覆盖部分配置（通过关键字传入新的值）
-    with_options = getattr(client, "with_options", None)
-    if request_timeout is not None and callable(with_options):
-        # 新客户端带有原来客户端的参数
-        stream_client = with_options(timeout=request_timeout)
-        stream_method = stream_client.messages.stream
-
-    worker = _StreamWorker(stream_method, stream_kwargs, on_text, _on_retry)
+    worker = _StreamWorker(client.messages.stream, kwargs, on_text, _on_retry)
     worker.start()
 
     # 轮询检查中断状态
@@ -454,8 +440,7 @@ def _stream_message_with_recovery(
 def _paused_text_blocks(content) -> tuple[list[TextBlock], bool]:
     """仅保留模型已经生成的文本，丢弃未执行或未完成的工具调用。
 
-    返回 (blocks, is_placeholder)：is_placeholder=True 表示模型没来得及输出任何文本，
-    blocks 是构造的兜底占位文本；UI 打印时需明确标注，避免被误以为是模型说的。
+    返回 (blocks, is_placeholder)：is_placeholder=True 表示模型没来得及输出任何文本。
     """
     blocks = [block for block in content if isinstance(block, TextBlock) and block.text]
     if blocks:
@@ -473,7 +458,7 @@ def _emit_assistant_message(
 ) -> None:
     """往 messages 追加一条 assistant 文本消息，并在 stream_output 时打印。
 
-    占位文本（pause 后无模型输出）会被显式标注，避免被误以为是模型说的。
+    在模型没有打印文本的时候就中断，提示用户模型尚未打印文本；否则打印模型返回文本。
     """
     messages.append({
         "role": "assistant",
@@ -488,38 +473,146 @@ def _emit_assistant_message(
             print(text)
 
 
-def _request_summary(messages, *, stream_output: bool) -> None:
+def _append_to_last_assistant(messages, text: str, *, stream_output: bool) -> None:
+    """给最后一条 assistant 消息追加说明，避免产生相邻 assistant 消息。"""
+    if not messages or messages[-1].get("role") != "assistant":
+        _emit_assistant_message(messages, text, stream_output=stream_output)
+        return
+    content = messages[-1].get("content")
+    if not isinstance(content, list):
+        content = [TextBlock(type="text", text=str(content or ""))]
+        messages[-1]["content"] = content
+    content.append(TextBlock(type="text", text=text))
+    if stream_output:
+        print(text)
+
+
+def _generate_context_summary(prompt: str, max_tokens: int) -> str:
+    """使用当前模型生成压缩摘要；不提供工具，不接受截断或中断的摘要。"""
+    res, interrupted = _stream_message_with_recovery(
+        model=MODEL_ID,
+        messages=[{"role": "user", "content": prompt}],
+        system=(
+            "You compact coding-agent conversation history into a precise checkpoint. "
+            "Do not answer the user and do not call tools."
+        ),
+        max_tokens=max_tokens,
+    )
+    if interrupted:
+        raise RuntimeError("context compression interrupted")
+    response_state = inspect_model_response(res)
+    if response_state.stop_reason is ModelStopReason.MAX_TOKENS:
+        raise RuntimeError("context summary reached max_tokens")
+    if response_state.stop_reason is ModelStopReason.REFUSAL:
+        raise RuntimeError("context summary was refused by the model")
+    summary = _assistant_text(res).strip()
+    if not summary:
+        raise RuntimeError("context summary was empty")
+    return summary
+
+
+def _create_context_compressor() -> ContextCompressor:
+    """按 config.yaml 创建本会话唯一的内置压缩器。"""
+    return ContextCompressor(
+        context_length=CONTEXT_SETTINGS.context_window,
+        max_tokens=CONTEXT_SETTINGS.max_output_tokens,
+        threshold_percent=CONTEXT_SETTINGS.compression_threshold,
+        protect_first_n=CONTEXT_SETTINGS.protect_first_n,
+        protect_last_n=CONTEXT_SETTINGS.protect_last_n,
+        summary_target_ratio=CONTEXT_SETTINGS.compression_target_ratio,
+        abort_on_summary_failure=CONTEXT_SETTINGS.abort_on_summary_failure,
+        summary_callback=_generate_context_summary,
+    )
+
+
+def _run_context_compression(
+    messages,
+    *,
+    context_state: ContextState,
+    context_compressor: ContextCompressor,
+    tool_definitions: list[dict],
+    current_tokens: int,
+) -> bool:
+    """执行一次压缩并显示结果；返回是否真正替换了历史。"""
+    print("\n\033[33m⟳ 正在压缩较早的对话上下文...\033[0m")
+    result = compress_context(
+        context_compressor,
+        context_state,
+        messages,
+        system=SYSTEM,
+        tools=tool_definitions,
+        current_tokens=current_tokens,
+    )
+    if result.changed:
+        print(
+            "\033[33m✓ 上下文压缩完成："
+            f"{result.before_messages} → {result.after_messages} 条消息\033[0m"
+        )
+        return True
+    if result.error:
+        print(
+            "\033[33m⚠️  上下文压缩失败，原历史未修改："
+            f"{result.error}\033[0m"
+        )
+    return False
+
+
+def _request_summary(
+    messages,
+    *,
+    stream_output: bool,
+    context_state: ContextState,
+) -> None:
     """迭代预算耗尽后，去掉 tools 再请求一次纯文本总结。"""
     label = f"iteration budget exhausted ({MAX_ITERATIONS}/{MAX_ITERATIONS})"
     # 真正的 api_call_count 由调用方在调用 _request_summary 之前已 ++
     print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
-    res, _ = _stream_message_with_recovery(
+    summary_system = (
+        SYSTEM
+        + "\nThe tool iteration budget is exhausted. Reply with a concise plain-text "
+        "summary only. Do not call tools or emit tool-call markup."
+    )
+    res, interrupted = _stream_message_with_recovery(
         model=MODEL_ID,  # type: ignore
         messages=messages,
-        system=(
-            SYSTEM
-            + "\nThe tool iteration budget is exhausted. Reply with a concise plain-text "
-            "summary only. Do not call tools or emit tool-call markup."
-        ),
+        system=summary_system,
         max_tokens=MAX_TOKENS_SUMMARY,
-        timeout=API_TIMEOUT,
         # 打印流式输出
         on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
     )
+    if not interrupted:
+        response_state = inspect_model_response(res)
+        context_state.update_from_response(
+            response_state,
+            system=summary_system,
+            messages=messages,
+            tools=[],
+            response_content=res.content,
+        )
     messages.append({"role": "assistant", "content": res.content})
 
 
-def agent_loop(messages, *, stream_output: bool = False):
+def agent_loop(
+    messages,
+    *,
+    stream_output: bool = False,
+    context_state: ContextState | None = None,
+    context_compressor: ContextCompressor | None = None,
+):
     global _last_interrupt_time
     interrupt_controller.clear()
     _last_interrupt_time = 0.0
+    if context_state is None:
+        context_state = ContextState.from_settings(CONTEXT_SETTINGS)
+    if context_compressor is None:
+        context_compressor = context_state._context_compressor
+        if context_compressor is None:
+            context_compressor = _create_context_compressor()
+            context_state._context_compressor = context_compressor
 
     # 每条用户请求开始时，重置重复调用计数、halt 锁存、文件修改失败记录。
     tool_guardrails.reset_for_turn()
     file_mutation_tracker.reset_for_turn()
-
-    # 开始记录本次会话的运行轨迹（每个 query 一份独立 trace 文件，落盘 logs/）
-    tr = reset_tracer()
 
     # 仅在 loop 执行期间接管 Ctrl+C；结束后恢复进入 loop 前的 handler。
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -535,32 +628,55 @@ def agent_loop(messages, *, stream_output: bool = False):
     post_tool_empty_retried = False
     # 本轮模型调用未知工具的连续重试次数，达到上限后停止本轮。
     invalid_tool_retries = 0
+    # 纯文本截断和工具调用截断分别有界重试，互不混用计数。
+    length_continuations = 0
+    truncated_response_retries = 0
+    request_max_tokens = MAX_OUTPUT_TOKENS
+    compression_attempts_this_turn = 0
 
     try:
         while api_call_count < MAX_ITERATIONS and not interrupt_controller.is_requested():
+            tool_definitions = registry.definitions()
+            rough_tokens = estimate_request_tokens_rough(
+                system=SYSTEM,
+                messages=messages,
+                tools=tool_definitions,
+            )
+            if (
+                COMPRESSION_ENABLED
+                and compression_attempts_this_turn < MAX_COMPRESSIONS_PER_TURN
+                and context_compressor.should_compress_preflight(
+                    messages,
+                    rough_tokens=rough_tokens,
+                )
+            ):
+                _run_context_compression(
+                    messages,
+                    context_state=context_state,
+                    context_compressor=context_compressor,
+                    tool_definitions=tool_definitions,
+                    current_tokens=rough_tokens,
+                )
+                compression_attempts_this_turn += 1
+                if interrupt_controller.is_requested():
+                    break
+
             api_call_count += 1
-            tr.step_start(api_call_count, len(messages), True, query=_last_user_text(messages))
             res, stream_interrupted = _stream_message_with_recovery(
                 model=MODEL_ID,
                 messages=messages,
                 system=SYSTEM,
-                max_tokens=MAX_TOKENS_TOOL,
-                tools=registry.definitions(),
-                timeout=API_TIMEOUT,
+                max_tokens=request_max_tokens,
+                tools=tool_definitions,
                 on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
             )
 
-            tr.step_done(
-                res.stop_reason,
-                # 模型要调用的所有工具名称
-                [b.name for b in res.content if isinstance(b, ToolUseBlock)],
-                # 模型回复的 text（str）
-                assistant_text=_assistant_text(res),
-            )
-
+            # 处理流式输出时的中断
             if stream_interrupted:
+                # is_placeholder：模型是否已经生成文本（True 表示没有；False 表示生成了）
                 paused_content, is_placeholder = _paused_text_blocks(res.content)
                 messages.append({"role": "assistant", "content": paused_content})
+                # 流式输出开启但是模型尚未返回文本块
                 if stream_output and not res.content:
                     text = paused_content[0].text
                     if is_placeholder:
@@ -568,6 +684,75 @@ def agent_loop(messages, *, stream_output: bool = False):
                     else:
                         print(text)
                 outcome = TurnOutcome.INTERRUPTED
+                break
+
+            response_state = inspect_model_response(res)
+            usage = context_state.update_from_response(
+                response_state,
+                system=SYSTEM,
+                messages=messages,
+                tools=tool_definitions,
+                response_content=res.content,
+            )
+            context_compressor.update_from_response({
+                "prompt_tokens": usage.effective_input_tokens,
+                "completion_tokens": usage.output_tokens,
+                "total_tokens": usage.effective_input_tokens + usage.output_tokens,
+                "estimated": usage.estimated,
+            })
+
+            # 长度终止必须先于空回复和普通完成处理。截断的工具参数不可信，
+            # 因此不写入历史也不执行，只提高输出预算后重试同一个请求。
+            if response_state.stop_reason is ModelStopReason.MAX_TOKENS:
+                if response_state.has_tool_calls or not response_state.has_text:
+                    truncated_kind = (
+                        "工具调用" if response_state.has_tool_calls else "空响应"
+                    )
+                    if truncated_response_retries < MAX_LENGTH_CONTINUATIONS:
+                        truncated_response_retries += 1
+                        request_max_tokens = min(
+                            MAX_OUTPUT_TOKENS * (truncated_response_retries + 1),
+                            CONTEXT_WINDOW,
+                        )
+                        print(
+                            f"\033[33m⚠️  模型{truncated_kind}被截断"
+                            + ("，未执行" if response_state.has_tool_calls else "")
+                            + "；正在扩大输出预算重试 "
+                            f"（{truncated_response_retries}/{MAX_LENGTH_CONTINUATIONS}）\033[0m"
+                        )
+                        continue
+                    stopped_text = (
+                        "[模型输出持续被截断，未执行不完整的工具调用，本轮已停止]"
+                        if response_state.has_tool_calls
+                        else "[模型持续在返回可见文本前达到输出上限，本轮已停止]"
+                    )
+                    _emit_assistant_message(
+                        messages,
+                        stopped_text,
+                        stream_output=stream_output,
+                    )
+                    outcome = TurnOutcome.OUTPUT_TRUNCATED
+                    break
+
+                messages.append({"role": "assistant", "content": res.content})
+                prev_step_had_tool_calls = False
+                if length_continuations < MAX_LENGTH_CONTINUATIONS:
+                    length_continuations += 1
+                    messages.append({
+                        "role": "user",
+                        "content": _LENGTH_CONTINUATION_PROMPT,
+                    })
+                    print(
+                        "\033[33m⚠️  模型文本达到输出上限，正在从断点继续 "
+                        f"（{length_continuations}/{MAX_LENGTH_CONTINUATIONS}）\033[0m"
+                    )
+                    continue
+                _append_to_last_assistant(
+                    messages,
+                    "\n[输出仍然达到长度上限，以上回答可能不完整]",
+                    stream_output=stream_output,
+                )
+                outcome = TurnOutcome.OUTPUT_TRUNCATED
                 break
 
             # 处理工具调用之后模型返回空消息的响应异常，给模型一次重试机会，重试失败就退出
@@ -599,10 +784,34 @@ def agent_loop(messages, *, stream_output: bool = False):
 
             messages.append({"role": "assistant", "content": res.content})
             prev_step_had_tool_calls = False
+            request_max_tokens = MAX_OUTPUT_TOKENS
+            truncated_response_retries = 0
 
-            if res.stop_reason != "tool_use":
+            if response_state.stop_reason in {
+                ModelStopReason.END_TURN,
+                ModelStopReason.STOP_SEQUENCE,
+            }:
                 outcome = TurnOutcome.COMPLETED
                 break
+            if response_state.stop_reason is ModelStopReason.REFUSAL:
+                if not response_state.has_text:
+                    _append_to_last_assistant(
+                        messages,
+                        "[模型拒绝了该请求，且未提供说明]",
+                        stream_output=stream_output,
+                    )
+                outcome = TurnOutcome.MODEL_REFUSED
+                break
+            if response_state.stop_reason is not ModelStopReason.TOOL_USE:
+                reason = response_state.raw_stop_reason or "missing"
+                _append_to_last_assistant(
+                    messages,
+                    f"[模型以当前 Agent 不支持的原因停止：{reason}]",
+                    stream_output=stream_output,
+                )
+                outcome = TurnOutcome.UNSUPPORTED_STOP_REASON
+                break
+            # 处理整个 loop 过程中的中断
             if interrupt_controller.is_requested():
                 # 不执行模型刚生成的工具调用，只保留它在暂停前已经输出的文本。
                 paused_content, is_placeholder = _paused_text_blocks(res.content)
@@ -650,7 +859,6 @@ def agent_loop(messages, *, stream_output: bool = False):
             )
             prev_step_had_tool_calls = True
 
-            # 与 Hermes 一致：guardrail halt 是一个明确的受控结束，不再额外调用模型总结。
             halt_decision = tool_guardrails.halt_decision
             # 只允许第一次写入，后面即使工具调用成功，也无法修改
             if halt_decision is not None:
@@ -662,6 +870,24 @@ def agent_loop(messages, *, stream_output: bool = False):
                 })
                 outcome = TurnOutcome.GUARDRAIL_HALT
                 break
+
+            # Hermes 的 post-response 触发：工具结果写回后，用本次真实 prompt usage
+            # 判断是否立即压缩；下一轮 API 前仍会再走一次 rough preflight 兜底。
+            if (
+                COMPRESSION_ENABLED
+                and compression_attempts_this_turn < MAX_COMPRESSIONS_PER_TURN
+                and context_compressor.should_compress()
+            ):
+                _run_context_compression(
+                    messages,
+                    context_state=context_state,
+                    context_compressor=context_compressor,
+                    tool_definitions=tool_definitions,
+                    current_tokens=max(0, context_compressor.last_prompt_tokens),
+                )
+                compression_attempts_this_turn += 1
+                if interrupt_controller.is_requested():
+                    break
 
         # 主循环结束但还没确定 outcome → 要么 iter 预算耗尽，要么 iter 中收到中断。
         if outcome is None:
@@ -684,21 +910,17 @@ def agent_loop(messages, *, stream_output: bool = False):
         # 唯一决策点：是否需要再发一次 summary 调用。
         # summary 不算入 api_call_count——它本质上是"预算耗尽"事件的副作用。
         if outcome.needs_summary:
-            _request_summary(messages, stream_output=stream_output)
+            _request_summary(
+                messages,
+                stream_output=stream_output,
+                context_state=context_state,
+            )
 
         notice = _append_file_mutation_notice(messages)
         if stream_output and notice:
             print(notice)
-        if outcome is TurnOutcome.ITERATION_BUDGET_EXHAUSTED:
-            tr.finish(
-                f"iteration budget exhausted ({api_call_count}/{MAX_ITERATIONS})",
-                api_call_count,
-            )
-        else:
-            tr.finish(outcome.value, api_call_count)
 
     except ProviderRequestInterrupted:
-        get_tracer().finish("provider_retry_interrupted", api_call_count)
         interrupted_text = "[API 重试已被用户暂停]"
         _emit_assistant_message(messages, interrupted_text, stream_output=stream_output)
     except ProviderRequestFailed as exc:
@@ -709,7 +931,6 @@ def agent_loop(messages, *, stream_output: bool = False):
             message += f"，HTTP {error.status_code}"
         if detail:
             message += f"：{detail}"
-        get_tracer().finish(f"provider_error:{error.kind}", api_call_count)
         _emit_assistant_message(messages, message, stream_output=stream_output)
     finally:
         signal.signal(signal.SIGINT, previous_sigint_handler)
@@ -720,6 +941,8 @@ def agent_loop(messages, *, stream_output: bool = False):
 if __name__ == "__main__":
     # 历史消息列表
     history = []
+    session_context = ContextState.from_settings(CONTEXT_SETTINGS)
+    session_compressor = _create_context_compressor()
     # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
     prompt_session = (
         PromptSession(
@@ -745,7 +968,12 @@ if __name__ == "__main__":
             # 将用户 query 追加到历史消息列表中
             history.append({"role": "user", "content": query})
 
-            agent_loop(history, stream_output=True)
+            agent_loop(
+                history,
+                stream_output=True,
+                context_state=session_context,
+                context_compressor=session_compressor,
+            )
         except EOFError:
             print("\n输入结束，退出交互")
             break

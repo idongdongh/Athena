@@ -21,7 +21,7 @@ os.environ.setdefault("MODEL_ID", "test-model")
 
 import agent.conversation_loop as conversation_loop
 import agent.tool_executor as tool_executor
-import agent.tracer as tracer_module
+from agent.context_state import ContextState
 from agent.file_mutation_tracker import FileMutationTracker
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -46,24 +46,20 @@ import tools.web_extract_tool as web_extract_module
 import tools.web_search_tool as web_search_module
 
 
-class _FakeTracer:
-    def step_start(self, *args, **kwargs):
-        pass
+class _CreateAsStreamAPI:
+    """让只实现 create 的 fake 走流式调用链：stream 转发到 create 并包装成一次性流。
 
-    def step_done(self, *args, **kwargs):
-        pass
+    chunks 为空——这些 fake 都不模拟流式 text delta，只关心 create 返回的最终消息。
+    stream() 体内引用的 _FakeStreamManager / _FakeMessageStream 在调用时按名字解析，
+    所以本基类只需定义在使用它的 fake 之前即可。
+    """
 
-    def finish(self, *args, **kwargs):
-        pass
-
-    def tool_call(self, *args, **kwargs):
-        pass
-
-    def tool_result(self, *args, **kwargs):
-        pass
+    def stream(self, **kwargs):
+        final_message = self.create(**kwargs)
+        return _FakeStreamManager(_FakeMessageStream([], final_message))
 
 
-class _FakeMessagesAPI:
+class _FakeMessagesAPI(_CreateAsStreamAPI):
     def __init__(self):
         self.calls = []
 
@@ -157,7 +153,7 @@ class _BlockingStreamingMessagesAPI:
         return _FakeStreamManager(self.stream_instance)
 
 
-class _SingleToolBatchAPI:
+class _SingleToolBatchAPI(_CreateAsStreamAPI):
     def __init__(self):
         self.calls = []
 
@@ -174,7 +170,7 @@ class _SingleToolBatchAPI:
         )
 
 
-class _FailingPatchThenDoneAPI:
+class _FailingPatchThenDoneAPI(_CreateAsStreamAPI):
     def __init__(self):
         self.calls = []
 
@@ -188,7 +184,7 @@ class _FailingPatchThenDoneAPI:
         return SimpleNamespace(stop_reason="end_turn", content=[TextBlock(type="text", text="all done")])
 
 
-class _PostToolEmptyThenDoneAPI:
+class _PostToolEmptyThenDoneAPI(_CreateAsStreamAPI):
     def __init__(self, stay_empty=False):
         self.calls = []
         self.stay_empty = stay_empty
@@ -286,22 +282,144 @@ class LogicRegressionTests(unittest.TestCase):
 
         self.assertIs(app.exit_kwargs["exception"], KeyboardInterrupt)
 
-    def test_anthropic_sdk_retries_are_disabled(self):
+    def test_anthropic_client_uses_shared_timeout_and_disables_sdk_retries(self):
         self.assertEqual(conversation_loop.client.max_retries, 0)
+        self.assertEqual(
+            conversation_loop.client.timeout.connect,
+            conversation_loop.API_CONNECT_TIMEOUT,
+        )
+        self.assertEqual(
+            conversation_loop.client.timeout.read,
+            conversation_loop.API_TIMEOUT,
+        )
 
     def test_normal_end_turn_does_not_request_summary(self):
         fake_client = SimpleNamespace(messages=_FakeMessagesAPI())
         messages = [{"role": "user", "content": "hello"}]
-        fake_tracer = _FakeTracer()
 
-        with (
-            patch.object(conversation_loop, "client", fake_client),
-            patch.object(conversation_loop, "reset_tracer", return_value=fake_tracer),
-        ):
+        with patch.object(conversation_loop, "client", fake_client):
             conversation_loop.agent_loop(messages)
 
         self.assertEqual(len(fake_client.messages.calls), 1)
         self.assertEqual(messages[-1]["content"][0].text, "done")
+
+    def test_max_tokens_text_continues_and_updates_context_state(self):
+        class TruncatedThenDoneAPI(_CreateAsStreamAPI):
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                index = len(self.calls)
+                return SimpleNamespace(
+                    stop_reason="max_tokens" if index == 1 else "end_turn",
+                    content=[TextBlock(
+                        type="text",
+                        text="partial" if index == 1 else " finished",
+                    )],
+                    usage=SimpleNamespace(
+                        input_tokens=10 * index,
+                        output_tokens=3,
+                    ),
+                )
+
+        api = TruncatedThenDoneAPI()
+        messages = [{"role": "user", "content": "write a long answer"}]
+        context_state = ContextState(context_window=1000, compression_threshold=0.75)
+        with patch.object(
+            conversation_loop, "client", SimpleNamespace(messages=api)
+        ):
+            conversation_loop.agent_loop(messages, context_state=context_state)
+
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["user", "assistant", "user", "assistant"],
+        )
+        self.assertIn("Continue exactly", messages[2]["content"])
+        self.assertEqual(context_state.session_input_tokens, 30)
+        self.assertEqual(context_state.session_output_tokens, 6)
+
+    def test_max_tokens_text_stops_after_continuation_limit(self):
+        class AlwaysTruncatedAPI(_CreateAsStreamAPI):
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    stop_reason="max_tokens",
+                    content=[TextBlock(type="text", text="partial")],
+                )
+
+        api = AlwaysTruncatedAPI()
+        messages = [{"role": "user", "content": "write"}]
+        with (
+            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+            patch.object(conversation_loop, "MAX_LENGTH_CONTINUATIONS", 1),
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(messages[-1]["role"], "assistant")
+        self.assertIn("可能不完整", messages[-1]["content"][-1].text)
+
+    def test_truncated_tool_call_is_retried_but_never_executed(self):
+        class TruncatedToolAPI(_CreateAsStreamAPI):
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    stop_reason="max_tokens",
+                    content=[ToolUseBlock(
+                        type="tool_use",
+                        id=f"truncated-{len(self.calls)}",
+                        name="bash",
+                        input={"command": "echo unsafe"},
+                    )],
+                )
+
+        api = TruncatedToolAPI()
+        messages = [{"role": "user", "content": "run a command"}]
+        with (
+            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+            patch.object(conversation_loop, "MAX_LENGTH_CONTINUATIONS", 2),
+            patch.object(conversation_loop, "MAX_OUTPUT_TOKENS", 100),
+            patch.object(conversation_loop, "CONTEXT_WINDOW", 1000),
+            patch.object(conversation_loop, "execute_tool_calls") as execute_tools,
+        ):
+            conversation_loop.agent_loop(messages)
+
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(
+            [call["max_tokens"] for call in api.calls],
+            [100, 200, 300],
+        )
+        execute_tools.assert_not_called()
+        self.assertIn("未执行不完整的工具调用", messages[-1]["content"][0].text)
+
+    def test_refusal_and_unknown_stop_reasons_end_cleanly(self):
+        for stop_reason, expected in (
+            ("refusal", "模型拒绝了该请求"),
+            ("future_reason", "不支持的原因停止：future_reason"),
+        ):
+            with self.subTest(stop_reason=stop_reason):
+                api = _FakeMessagesAPI()
+                api.create = lambda **_kwargs: SimpleNamespace(
+                    stop_reason=stop_reason,
+                    content=[],
+                )
+                messages = [{"role": "user", "content": "hello"}]
+                with patch.object(
+                    conversation_loop,
+                    "client",
+                    SimpleNamespace(messages=api),
+                ):
+                    conversation_loop.agent_loop(messages)
+                self.assertEqual(messages[-1]["role"], "assistant")
+                self.assertIn(expected, messages[-1]["content"][-1].text)
 
     def test_streaming_emits_text_deltas_and_preserves_final_message(self):
         final_message = SimpleNamespace(
@@ -321,7 +439,6 @@ class LogicRegressionTests(unittest.TestCase):
                 messages=[{"role": "user", "content": "hello"}],
                 system="test",
                 max_tokens=32,
-                timeout=1.0,
                 on_text=emitted.append,
             )
 
@@ -348,13 +465,10 @@ class LogicRegressionTests(unittest.TestCase):
         )
         messages = [{"role": "user", "content": "create test1"}]
 
-        with (
-            patch.object(
-                conversation_loop,
-                "client",
-                SimpleNamespace(messages=fake_api),
-            ),
-            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
+        with patch.object(
+            conversation_loop,
+            "client",
+            SimpleNamespace(messages=fake_api),
         ):
             conversation_loop.agent_loop(messages)
 
@@ -386,7 +500,6 @@ class LogicRegressionTests(unittest.TestCase):
                     messages=[{"role": "user", "content": "hello"}],
                     system="test",
                     max_tokens=32,
-                    timeout=1.0,
                     on_text=emitted.append,
                 )
         finally:
@@ -459,16 +572,13 @@ class LogicRegressionTests(unittest.TestCase):
             status_code = 401
             response = None
 
-        class FailingMessagesAPI:
+        class FailingMessagesAPI(_CreateAsStreamAPI):
             def create(self, **_kwargs):
                 raise AuthenticationError("invalid API key")
 
         messages = [{"role": "user", "content": "hello"}]
         fake_client = SimpleNamespace(messages=FailingMessagesAPI())
-        with (
-            patch.object(conversation_loop, "client", fake_client),
-            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-        ):
+        with patch.object(conversation_loop, "client", fake_client):
             conversation_loop.agent_loop(messages)
 
         self.assertEqual(messages[-1]["role"], "assistant")
@@ -595,11 +705,10 @@ class LogicRegressionTests(unittest.TestCase):
         controller.after_call("read_file", args, '{"error": "missing"}', failed=True)
         counts_before = dict(controller._exact_failure_counts)
 
-        with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
-            outcome = tool_executor._finalize_outcome(
-                tool_executor._cancelled_outcome("read_file", "test interrupt"),
-                args,
-            )
+        outcome = tool_executor._finalize_outcome(
+            tool_executor._cancelled_outcome("read_file", "test interrupt"),
+            args,
+        )
 
         self.assertEqual(outcome.status, CANCELLED)
         self.assertEqual(controller._exact_failure_counts, counts_before)
@@ -626,10 +735,7 @@ class LogicRegressionTests(unittest.TestCase):
         ]
         messages = []
         try:
-            with (
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
-                patch.object(tool_executor, "check_tool_permission", return_value=None),
-            ):
+            with patch.object(tool_executor, "check_tool_permission", return_value=None):
                 tool_executor.execute_tool_calls(
                     calls,
                     messages,
@@ -687,10 +793,7 @@ class LogicRegressionTests(unittest.TestCase):
             return False
 
         try:
-            with (
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
-                patch.object(tool_executor, "check_tool_permission", return_value=None),
-            ):
+            with patch.object(tool_executor, "check_tool_permission", return_value=None):
                 tool_executor.execute_tool_calls(
                     calls,
                     messages,
@@ -717,8 +820,6 @@ class LogicRegressionTests(unittest.TestCase):
         try:
             with (
                 patch.object(conversation_loop, "client", SimpleNamespace(messages=fake_api)),
-                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
                 patch.object(tool_executor, "check_tool_permission", return_value=None),
             ):
                 messages = [{"role": "user", "content": "run empty probe"}]
@@ -745,8 +846,6 @@ class LogicRegressionTests(unittest.TestCase):
         try:
             with (
                 patch.object(conversation_loop, "client", SimpleNamespace(messages=fake_api)),
-                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
                 patch.object(tool_executor, "check_tool_permission", return_value=None),
             ):
                 messages = [{"role": "user", "content": "run empty probe"}]
@@ -763,11 +862,9 @@ class LogicRegressionTests(unittest.TestCase):
     def test_permission_block_does_not_increment_guardrail(self):
         call = SimpleNamespace(type="tool_use", id="blocked-1", name="read_file", input={"path": "x.py"})
         messages = []
-        fake_tracer = _FakeTracer()
         tool_executor.tool_guardrails.reset_for_turn()
-        with (
-            patch.object(tool_executor, "check_tool_permission", return_value="denied by policy"),
-            patch.object(tool_executor, "get_tracer", return_value=fake_tracer),
+        with patch.object(
+            tool_executor, "check_tool_permission", return_value="denied by policy"
         ):
             tool_executor.execute_tool_calls([call], messages)
         self.assertEqual(tool_executor.tool_guardrails._exact_failure_counts, {})
@@ -789,9 +886,8 @@ class LogicRegressionTests(unittest.TestCase):
         )
         tool_executor.tool_guardrails.reset_for_turn()
         try:
-            with (
-                patch.object(tool_executor, "check_tool_permission", return_value="denied"),
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+            with patch.object(
+                tool_executor, "check_tool_permission", return_value="denied"
             ):
                 result = tool_executor.dispatch_tool_call("read_file", {"path": "x.py"})
         finally:
@@ -801,7 +897,7 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertEqual(tool_executor.tool_guardrails._exact_failure_counts, {})
 
     def test_unknown_tool_retries_are_counted_per_model_round(self):
-        class InvalidRoundsAPI:
+        class InvalidRoundsAPI(_CreateAsStreamAPI):
             def __init__(self):
                 self.calls = []
 
@@ -820,10 +916,7 @@ class LogicRegressionTests(unittest.TestCase):
 
         api = InvalidRoundsAPI()
         messages = [{"role": "user", "content": "use a missing tool"}]
-        with (
-            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
-            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-        ):
+        with patch.object(conversation_loop, "client", SimpleNamespace(messages=api)):
             conversation_loop.agent_loop(messages)
 
         self.assertEqual(len(api.calls), 3)
@@ -831,7 +924,7 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertIsNone(tool_executor.tool_guardrails.halt_decision)
 
     def test_multiple_unknown_tools_in_one_batch_only_consume_one_retry(self):
-        class OneInvalidBatchAPI:
+        class OneInvalidBatchAPI(_CreateAsStreamAPI):
             def __init__(self):
                 self.calls = []
 
@@ -854,10 +947,7 @@ class LogicRegressionTests(unittest.TestCase):
 
         api = OneInvalidBatchAPI()
         messages = [{"role": "user", "content": "use tools"}]
-        with (
-            patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
-            patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-        ):
+        with patch.object(conversation_loop, "client", SimpleNamespace(messages=api)):
             conversation_loop.agent_loop(messages)
 
         self.assertEqual(len(api.calls), 2)
@@ -895,7 +985,7 @@ class LogicRegressionTests(unittest.TestCase):
         self.assertIn("Unknown tool", results[1]["content"])
 
     def test_valid_tool_round_resets_unknown_tool_retries(self):
-        class ResettingAPI:
+        class ResettingAPI(_CreateAsStreamAPI):
             def __init__(self):
                 self.calls = []
 
@@ -937,8 +1027,6 @@ class LogicRegressionTests(unittest.TestCase):
         try:
             with (
                 patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
-                patch.object(conversation_loop, "reset_tracer", return_value=_FakeTracer()),
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
                 patch.object(tool_executor, "check_tool_permission", return_value=None),
             ):
                 messages = [{"role": "user", "content": "retry tools"}]
@@ -962,10 +1050,7 @@ class LogicRegressionTests(unittest.TestCase):
         messages = []
         tool_executor.tool_guardrails.reset_for_turn()
 
-        with (
-            patch.object(tool_executor, "_execute_raw_tool_call") as execute_raw,
-            patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
-        ):
+        with patch.object(tool_executor, "_execute_raw_tool_call") as execute_raw:
             tool_executor.execute_tool_calls([call], messages)
 
         execute_raw.assert_not_called()
@@ -986,8 +1071,7 @@ class LogicRegressionTests(unittest.TestCase):
         )
         tool_executor.tool_guardrails.reset_for_turn()
         try:
-            with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
-                result = tool_executor.dispatch_tool_call("argument_probe", {"file": "x.py"})
+            result = tool_executor.dispatch_tool_call("argument_probe", {"file": "x.py"})
         finally:
             if previous is None:
                 registry._tools.pop("argument_probe", None)
@@ -1020,8 +1104,7 @@ class LogicRegressionTests(unittest.TestCase):
         )
         messages = []
 
-        with patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()):
-            tool_executor.execute_tool_calls([call], messages)
+        tool_executor.execute_tool_calls([call], messages)
 
         self.assertEqual(messages[-1]["content"][0]["tool_use_id"], "bad-input")
         self.assertIn("tool input must be a JSON object", messages[-1]["content"][0]["content"])
@@ -1254,9 +1337,8 @@ class LogicRegressionTests(unittest.TestCase):
         )
         tool_executor.tool_guardrails.reset_for_turn()
         try:
-            with (
-                patch.object(tool_executor, "check_tool_permission", side_effect=permission),
-                patch.object(tool_executor, "get_tracer", return_value=_FakeTracer()),
+            with patch.object(
+                tool_executor, "check_tool_permission", side_effect=permission
             ):
                 tool_executor.dispatch_tool_call("coercion_integration_probe", {"count": "7"})
         finally:
@@ -1279,13 +1361,11 @@ class LogicRegressionTests(unittest.TestCase):
     def test_parallel_results_are_finalized_in_model_order(self):
         started = threading.Event()
         release = threading.Event()
-        trace_names = []
+        finalized_names = []
+        finalization_threads = []
         classification_threads = []
         original_classifier = tool_executor.classify_tool_result
-
-        class RecordingTracer(_FakeTracer):
-            def tool_result(self, name, *_args, **_kwargs):
-                trace_names.append(name)
+        original_finalizer = tool_executor._finalize_outcome
 
         def slow_read(**_kwargs):
             started.set()
@@ -1301,6 +1381,11 @@ class LogicRegressionTests(unittest.TestCase):
             classification_threads.append(threading.current_thread().name)
             return original_classifier(*args, **kwargs)
 
+        def record_finalization(outcome, args):
+            finalized_names.append(outcome.tool_name)
+            finalization_threads.append(threading.current_thread().name)
+            return original_finalizer(outcome, args)
+
         old_read = registry.get_entry("read_file")
         old_search = registry.get_entry("search_files")
         registry.register("read_file", {"name": "read_file", "input_schema": {"type": "object"}}, slow_read)
@@ -1311,15 +1396,16 @@ class LogicRegressionTests(unittest.TestCase):
         ]
         try:
             with (
-                patch.object(tool_executor, "get_tracer", return_value=RecordingTracer()),
                 patch.object(tool_executor, "classify_tool_result", side_effect=record_classification),
+                patch.object(tool_executor, "_finalize_outcome", side_effect=record_finalization),
             ):
                 messages = []
                 tool_executor.execute_tool_calls(calls, messages, concurrent=True)
         finally:
             registry._tools["read_file"] = old_read
             registry._tools["search_files"] = old_search
-        self.assertEqual(trace_names, ["read_file", "search_files"])
+        self.assertEqual(finalized_names, ["read_file", "search_files"])
+        self.assertEqual(finalization_threads, ["MainThread", "MainThread"])
         self.assertEqual(classification_threads, ["MainThread", "MainThread"])
         self.assertIn("slow", messages[-1]["content"][0]["content"])
         self.assertIn("fast", messages[-1]["content"][1]["content"])
@@ -1349,7 +1435,6 @@ class LogicRegressionTests(unittest.TestCase):
 
     def test_final_answer_exposes_unrecovered_file_failure(self):
         fake_client = SimpleNamespace(messages=_FailingPatchThenDoneAPI())
-        fake_tracer = _FakeTracer()
         previous = registry.get_entry("patch")
         registry.register(
             "patch", {"name": "patch", "input_schema": {"type": "object"}},
@@ -1358,8 +1443,6 @@ class LogicRegressionTests(unittest.TestCase):
         try:
             with (
                 patch.object(conversation_loop, "client", fake_client),
-                patch.object(conversation_loop, "reset_tracer", return_value=fake_tracer),
-                patch.object(tool_executor, "get_tracer", return_value=fake_tracer),
                 patch.object(tool_executor, "check_tool_permission", return_value=None),
             ):
                 messages = [{"role": "user", "content": "edit a.py"}]
@@ -1372,7 +1455,6 @@ class LogicRegressionTests(unittest.TestCase):
 
     def test_guardrail_halt_returns_controlled_response_without_summary(self):
         fake_client = SimpleNamespace(messages=_SingleToolBatchAPI())
-        fake_tracer = _FakeTracer()
         messages = [{"role": "user", "content": "run failing tool"}]
         executions = 0
 
@@ -1388,11 +1470,7 @@ class LogicRegressionTests(unittest.TestCase):
             fail_probe,
         )
         try:
-            with (
-                patch.object(conversation_loop, "client", fake_client),
-                patch.object(conversation_loop, "reset_tracer", return_value=fake_tracer),
-                patch.object(tool_executor, "get_tracer", return_value=fake_tracer),
-            ):
+            with patch.object(conversation_loop, "client", fake_client):
                 conversation_loop.agent_loop(messages)
         finally:
             if previous is None:
@@ -1463,24 +1541,6 @@ class LogicRegressionTests(unittest.TestCase):
         with patch.dict(os.environ, {"SUDO_PASSWORD": "configured"}):
             blocked, _ = _check_sudo_stdin_guard("sudo -S whoami")
         self.assertTrue(blocked)
-
-    def test_trace_paths_are_unique(self):
-        with tempfile.TemporaryDirectory() as task_tmp:
-            with patch.object(tracer_module, "TRACE_DIR", task_tmp):
-                first = tracer_module.Tracer()
-                second = tracer_module.Tracer()
-        self.assertNotEqual(first.path, second.path)
-
-    def test_trace_records_outcome_status(self):
-        outcome = classify_tool_result("bash", '{"exit_code": 3, "stderr": "bad"}')
-        with tempfile.TemporaryDirectory() as task_tmp:
-            with patch.object(tracer_module, "TRACE_DIR", task_tmp):
-                trace = tracer_module.Tracer()
-                trace.tool_result("bash", outcome.content, outcome=outcome)
-                record = json.loads(Path(trace.path).read_text(encoding="utf-8"))
-        self.assertEqual(record["status"], FAILED)
-        self.assertEqual(record["error_code"], "nonzero_exit")
-
 
 if __name__ == "__main__":
     unittest.main()

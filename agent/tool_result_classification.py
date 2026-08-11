@@ -1,7 +1,7 @@
 """统一的工具执行结果分类。
 
 工具 handler 只返回原始内容；本模块在主线程把内容归类为成功、执行失败、
-策略阻断等状态。guardrail、trace 和最终核验都消费同一个 ``ToolOutcome``。
+策略阻断等状态。guardrail 和最终核验都消费同一个 ``ToolOutcome``。
 """
 
 from __future__ import annotations

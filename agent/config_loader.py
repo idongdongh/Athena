@@ -26,6 +26,7 @@ def load_config(path: Path | str | None = None) -> dict:
     if not config_path.exists():
         return {}
     try:
+        # safe_load：将 yaml 文件内容转化为 python 对象
         data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise RuntimeError(f"无法读取配置文件 {config_path}: {exc}") from exc

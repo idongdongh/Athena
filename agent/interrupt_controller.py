@@ -24,23 +24,23 @@ class InterruptController:
         self._event = threading.Event()
 
     def request(self) -> None:
-        """发出信号即请求当前 agent turn 尽快停止。"""
+        """发出信号，表示用户已中断。"""
         self._event.set()
 
     def clear(self) -> None:
-        """清除信号即清除上一轮中断，供下一轮安全复用。"""
+        """清除信号，清除上一轮中断，供下一轮安全复用。"""
         self._event.clear()
 
     def is_requested(self) -> bool:
-        """判断信号是否发送即当前 turn 是否已收到中断请求。"""
+        """检查信号，检查是否用户是否中断。"""
         return self._event.is_set()
 
     def wait(self, timeout: float | None = None) -> bool:
-        """等待中断；收到请求返回 True，超时返回 False。"""
+        """等待信号，等待 timeout 秒，如果收到信号返回 True 反之返回 False。"""
         return self._event.wait(timeout)
 
     def raise_if_requested(self, reason: str = "operation interrupted by user") -> None:
-        """收到中断时抛出工具层可识别的取消异常。"""
+        """收到中断请求，抛出 ToolExecutionCancelled 异常。"""
         if self.is_requested():
             raise ToolExecutionCancelled(reason)
 
