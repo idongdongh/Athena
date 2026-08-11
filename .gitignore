@@ -36,6 +36,9 @@ AGENT_HANDOFF.md
 # 含安全实现细节，公开会暴露权限闸门防御机制）
 notebook/
 
+# 本地回归测试，不发布到远端仓库
+tests/
+
 # .DS_Store（macOS 系统文件）
 .DS_Store
 
