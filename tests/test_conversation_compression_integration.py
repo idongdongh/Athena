@@ -2,7 +2,9 @@
 
 import copy
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,6 +16,8 @@ os.environ.setdefault("MODEL_ID", "test-model")
 import agent.conversation_loop as conversation_loop
 from agent.context_compressor import SUMMARY_PREFIX, ContextCompressor
 from agent.context_state import ContextState
+from agent.session_db import SessionDB
+from agent.session_runtime import SessionRuntime
 
 
 class _Stream:
@@ -173,6 +177,42 @@ class ConversationCompressionIntegrationTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "max_tokens"):
                 conversation_loop._generate_context_summary("prompt", 256)
+
+    def test_agent_loop_flushes_messages_and_usage_incrementally(self):
+        api = _MessagesAPI([
+            SimpleNamespace(
+                stop_reason="end_turn",
+                content=[TextBlock(type="text", text="persisted answer")],
+                usage=SimpleNamespace(input_tokens=25, output_tokens=4),
+            )
+        ])
+        messages = [{"role": "user", "content": "persist this"}]
+        state = ContextState(context_window=2000, compression_threshold=0.9)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(Path(tmp) / "state.db")
+            runtime = SessionRuntime.start(db, model="test-model")
+            with (
+                patch.object(conversation_loop, "client", SimpleNamespace(messages=api)),
+                patch.object(conversation_loop, "COMPRESSION_ENABLED", False),
+            ):
+                conversation_loop.agent_loop(
+                    messages,
+                    context_state=state,
+                    context_compressor=_compressor(),
+                    session_runtime=runtime,
+                )
+
+            stored = db.get_messages_as_conversation(runtime.session_id)
+            session = db.get_session(runtime.session_id)
+            db.close()
+
+        self.assertEqual([item["role"] for item in stored], ["user", "assistant"])
+        self.assertEqual(stored[0]["content"], "persist this")
+        self.assertEqual(stored[1]["content"][0]["text"], "persisted answer")
+        self.assertEqual(session["input_tokens"], 25)
+        self.assertEqual(session["output_tokens"], 4)
+        self.assertEqual(session["api_call_count"], 1)
 
 
 if __name__ == "__main__":

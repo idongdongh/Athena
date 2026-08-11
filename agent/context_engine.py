@@ -48,6 +48,10 @@ class ContextEngine(ABC):
         """API 调用前的粗估检查。"""
         return False
 
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """粗估已知偏高时，是否等待 Provider 的真实 usage 再判断。"""
+        return False
+
     def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
         return True
 

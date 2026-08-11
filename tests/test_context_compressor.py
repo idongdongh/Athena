@@ -47,6 +47,22 @@ class ContextCompressorTests(unittest.TestCase):
         )
         self.assertEqual(compressor.threshold_tokens, 400)
 
+    def test_preflight_defers_until_real_usage_after_compression(self):
+        compressor = self._compressor()
+        compressor.last_compression_rough_tokens = 500
+        compressor.last_prompt_tokens = -1
+        compressor.awaiting_real_usage_after_compression = True
+
+        self.assertTrue(compressor.should_defer_preflight_to_real_usage(600))
+
+        compressor.update_from_response({
+            "prompt_tokens": 300,
+            "completion_tokens": 20,
+            "total_tokens": 320,
+        })
+        self.assertTrue(compressor.should_defer_preflight_to_real_usage(600))
+        self.assertFalse(compressor.should_defer_preflight_to_real_usage(5000))
+
     def test_compress_protects_head_and_latest_exchange(self):
         messages = _long_conversation()
         compressor = self._compressor()

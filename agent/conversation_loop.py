@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -35,6 +36,10 @@ from agent.provider_error_recovery import (
     classify_provider_error,
     request_with_retries,
 )
+from agent.session_runtime import SessionRuntime
+from agent.session_runtime import SessionSettings
+from agent.session_db import SessionDB
+from agent.session_commands import handle_session_command
 from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
 
 load_dotenv(override=True)
@@ -68,6 +73,7 @@ MODEL_ID = _model_id
 _project_config = load_config()
 # 基于配置初始化一个 ContextSettings 对象
 CONTEXT_SETTINGS = ContextSettings.from_mapping(_project_config)
+SESSION_SETTINGS = SessionSettings.from_mapping(_project_config)
 
 
 def _build_system() -> str:
@@ -97,6 +103,7 @@ MAX_LENGTH_CONTINUATIONS = CONTEXT_SETTINGS.max_length_continuations
 CONTEXT_WINDOW = CONTEXT_SETTINGS.context_window
 COMPRESSION_ENABLED = CONTEXT_SETTINGS.compression_enabled
 MAX_COMPRESSIONS_PER_TURN = CONTEXT_SETTINGS.max_compressions_per_turn
+COMPRESSION_IN_PLACE = CONTEXT_SETTINGS.compression_in_place
 
 _LENGTH_CONTINUATION_PROMPT = (
     "Continue exactly where the previous response stopped. Do not repeat earlier text. "
@@ -532,6 +539,7 @@ def _run_context_compression(
     context_compressor: ContextCompressor,
     tool_definitions: list[dict],
     current_tokens: int,
+    session_runtime: SessionRuntime | None = None,
 ) -> bool:
     """执行一次压缩并显示结果；返回是否真正替换了历史。"""
     print("\n\033[33m⟳ 正在压缩较早的对话上下文...\033[0m")
@@ -542,6 +550,8 @@ def _run_context_compression(
         system=SYSTEM,
         tools=tool_definitions,
         current_tokens=current_tokens,
+        session_runtime=session_runtime,
+        in_place=COMPRESSION_IN_PLACE,
     )
     if result.changed:
         print(
@@ -592,12 +602,35 @@ def _request_summary(
     messages.append({"role": "assistant", "content": res.content})
 
 
+def _restore_context_components(
+    runtime: SessionRuntime,
+    messages: list[dict[str, Any]],
+) -> tuple[ContextState, ContextCompressor]:
+    """根据持久会话重建派生 token 状态；消息内容只使用传入的 history。"""
+    context_state = ContextState.from_settings(CONTEXT_SETTINGS)
+    session = runtime.db.get_session(runtime.session_id) or {}
+    current_tokens = estimate_request_tokens_rough(
+        system=SYSTEM,
+        messages=messages,
+        tools=registry.definitions(),
+    )
+    context_state.restore_session_totals(
+        input_tokens=int(session.get("input_tokens") or 0),
+        output_tokens=int(session.get("output_tokens") or 0),
+        current_input_tokens=current_tokens,
+    )
+    compressor = _create_context_compressor()
+    context_state._context_compressor = compressor
+    return context_state, compressor
+
+
 def agent_loop(
     messages,
     *,
     stream_output: bool = False,
     context_state: ContextState | None = None,
     context_compressor: ContextCompressor | None = None,
+    session_runtime: SessionRuntime | None = None,
 ):
     global _last_interrupt_time
     interrupt_controller.clear()
@@ -636,6 +669,11 @@ def agent_loop(
 
     try:
         while api_call_count < MAX_ITERATIONS and not interrupt_controller.is_requested():
+            if session_runtime is not None:
+                try:
+                    session_runtime.flush_new_messages(messages)
+                except Exception as exc:
+                    print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
             tool_definitions = registry.definitions()
             rough_tokens = estimate_request_tokens_rough(
                 system=SYSTEM,
@@ -656,6 +694,7 @@ def agent_loop(
                     context_compressor=context_compressor,
                     tool_definitions=tool_definitions,
                     current_tokens=rough_tokens,
+                    session_runtime=session_runtime,
                 )
                 compression_attempts_this_turn += 1
                 if interrupt_controller.is_requested():
@@ -700,6 +739,11 @@ def agent_loop(
                 "total_tokens": usage.effective_input_tokens + usage.output_tokens,
                 "estimated": usage.estimated,
             })
+            if session_runtime is not None:
+                try:
+                    session_runtime.record_usage(usage)
+                except Exception as exc:
+                    print(f"\n\033[33m⚠️  会话 usage 保存失败：{exc}\033[0m")
 
             # 长度终止必须先于空回复和普通完成处理。截断的工具参数不可信，
             # 因此不写入历史也不执行，只提高输出预算后重试同一个请求。
@@ -884,6 +928,7 @@ def agent_loop(
                     context_compressor=context_compressor,
                     tool_definitions=tool_definitions,
                     current_tokens=max(0, context_compressor.last_prompt_tokens),
+                    session_runtime=session_runtime,
                 )
                 compression_attempts_this_turn += 1
                 if interrupt_controller.is_requested():
@@ -933,6 +978,11 @@ def agent_loop(
             message += f"：{detail}"
         _emit_assistant_message(messages, message, stream_output=stream_output)
     finally:
+        if session_runtime is not None:
+            try:
+                session_runtime.flush_new_messages(messages)
+            except Exception as exc:
+                print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
         signal.signal(signal.SIGINT, previous_sigint_handler)
         interrupt_controller.clear()
         _last_interrupt_time = 0.0
@@ -943,6 +993,38 @@ if __name__ == "__main__":
     history = []
     session_context = ContextState.from_settings(CONTEXT_SETTINGS)
     session_compressor = _create_context_compressor()
+    session_db: SessionDB | None = None
+    session_runtime: SessionRuntime | None = None
+    if SESSION_SETTINGS.enabled:
+        try:
+            project_root = Path(__file__).resolve().parents[1]
+            session_db = SessionDB(
+                SESSION_SETTINGS.resolve_database_path(project_root)
+            )
+            recent_sessions = session_db.list_sessions_rich(limit=1)
+            if SESSION_SETTINGS.auto_resume and recent_sessions:
+                session_runtime, history = SessionRuntime.resume(
+                    session_db,
+                    recent_sessions[0]["id"],
+                )
+                print(f"\033[90m已恢复会话：{session_runtime.session_id}\033[0m")
+            else:
+                session_runtime = SessionRuntime.start(
+                    session_db,
+                    model=MODEL_ID,
+                    model_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
+                    system_prompt=SYSTEM,
+                )
+            session_context, session_compressor = _restore_context_components(
+                session_runtime,
+                history,
+            )
+        except Exception as exc:
+            if session_db is not None:
+                session_db.close()
+            session_db = None
+            session_runtime = None
+            print(f"\033[33m⚠️  会话数据库初始化失败，改用内存模式：{exc}\033[0m")
     # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
     prompt_session = (
         PromptSession(
@@ -965,6 +1047,37 @@ if __name__ == "__main__":
                 # 管道输入不是交互终端，保留 input() 以支持脚本和 smoke test。
                 query = input("\033[33m >> \033[0m")
 
+            if session_db is not None and session_runtime is not None:
+                try:
+                    command_result = handle_session_command(
+                        query,
+                        db=session_db,
+                        runtime=session_runtime,
+                        model=MODEL_ID,
+                        system_prompt=SYSTEM,
+                    )
+                except (KeyError, ValueError) as exc:
+                    print(f"\033[33m⚠️  {exc}\033[0m")
+                    continue
+                if command_result.handled:
+                    if command_result.output:
+                        print(command_result.output)
+                    if command_result.runtime is not None:
+                        session_runtime = command_result.runtime
+                    if command_result.messages is not None:
+                        history = command_result.messages
+                    if command_result.reset_context:
+                        session_context, session_compressor = (
+                            _restore_context_components(session_runtime, history)
+                        )
+                    continue
+                if query.strip().startswith("/"):
+                    print(
+                        f"未知命令：{query.strip().split()[0]}。"
+                        "可用会话命令：/new、/sessions、/resume、/search、/archive"
+                    )
+                    continue
+
             # 将用户 query 追加到历史消息列表中
             history.append({"role": "user", "content": query})
 
@@ -973,6 +1086,7 @@ if __name__ == "__main__":
                 stream_output=True,
                 context_state=session_context,
                 context_compressor=session_compressor,
+                session_runtime=session_runtime,
             )
         except EOFError:
             print("\n输入结束，退出交互")
@@ -980,3 +1094,11 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n收到 Ctrl+C，退出交互")
             break
+    if session_runtime is not None:
+        try:
+            session_runtime.flush_new_messages(history)
+            session_runtime.end("user_exit")
+        except Exception as exc:
+            print(f"\033[33m⚠️  退出时保存会话失败：{exc}\033[0m")
+    if session_db is not None:
+        session_db.close()

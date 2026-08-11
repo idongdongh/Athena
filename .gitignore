@@ -44,5 +44,9 @@ notebook/
 .idea/
 .vscode/
 *.swp
+.zcode/
+
+# hello-agent 本地会话数据库及 WAL 辅助文件
+.hello-agent/
 
 all_dataclass.py

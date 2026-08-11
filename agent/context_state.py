@@ -1,7 +1,5 @@
 """会话级 token 统计与上下文压力状态。"""
 
-import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +22,7 @@ class ContextSettings:
     protect_last_n: int = 6
     abort_on_summary_failure: bool = True
     max_compressions_per_turn: int = 2
+    compression_in_place: bool = False
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any] | None) -> "ContextSettings":
@@ -75,6 +74,9 @@ class ContextSettings:
                 compression.get("max_per_turn"),
                 defaults.max_compressions_per_turn,
             ),
+            compression_in_place=_boolean(
+                compression.get("in_place"), defaults.compression_in_place
+            ),
         )
 
 
@@ -100,35 +102,113 @@ def _boolean(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
-def _json_default(value: Any) -> Any:
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return model_dump()
-    attributes = getattr(value, "__dict__", None)
-    if isinstance(attributes, dict):
-        return attributes
-    return str(value)
-
-
 def estimate_tokens_rough(value: Any) -> int:
-    serialized = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        # 遇到 JSON 不认识对象时交给 _json_default 函数处理
-        default=_json_default,
-    )
-    # 使用 UTF-8 编码在计算字节数在除以 4，在向上取整
-    return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
+    """Hermes 同款粗估：按字符数向上取整，每 4 个字符约 1 token。"""
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return 0
+    return (len(text) + 3) // 4
+
+
+def _block_mapping(block: Any) -> Mapping[str, Any] | None:
+    if isinstance(block, Mapping):
+        return block
+    model_dump = getattr(block, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dumped
+    return None
+
+
+def _count_image_tokens(message: Mapping[str, Any], cost_per_image: int) -> int:
+    """图片按固定成本计数，避免把 Base64 字符串误算成上下文文本。"""
+    count = 0
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            block = _block_mapping(part)
+            if block is not None and block.get("type") in {
+                "image",
+                "image_url",
+                "input_image",
+            }:
+                count += 1
+    stashed = message.get("_anthropic_content_blocks")
+    if isinstance(stashed, list):
+        for part in stashed:
+            block = _block_mapping(part)
+            if block is not None and block.get("type") == "image":
+                count += 1
+    if isinstance(content, Mapping) and content.get("_multimodal"):
+        inner = content.get("content")
+        if isinstance(inner, list):
+            for part in inner:
+                block = _block_mapping(part)
+                if block is not None and block.get("type") in {
+                    "image",
+                    "image_url",
+                }:
+                    count += 1
+    return count * cost_per_image
+
+
+def _estimate_message_chars(message: Any) -> int:
+    """计算消息字符数，但移除由固定 token 成本单独计算的图片数据。"""
+    if not isinstance(message, Mapping):
+        return len(str(message))
+    shadow: dict[str, Any] = {}
+    for key, value in message.items():
+        if key == "_anthropic_content_blocks":
+            continue
+        if key != "content":
+            shadow[key] = value
+            continue
+        if isinstance(value, list):
+            cleaned: list[Any] = []
+            for part in value:
+                block = _block_mapping(part)
+                if block is not None and block.get("type") in {
+                    "image",
+                    "image_url",
+                    "input_image",
+                }:
+                    cleaned.append({"type": block.get("type"), "image": "[stripped]"})
+                elif block is not None:
+                    cleaned.append(dict(block))
+                else:
+                    cleaned.append(part)
+            shadow[key] = cleaned
+        elif isinstance(value, Mapping) and value.get("_multimodal"):
+            shadow[key] = value.get("text_summary", "")
+        else:
+            shadow[key] = value
+    return len(str(shadow))
+
+
+def estimate_messages_tokens_rough(messages: list[dict[str, Any]] | Any) -> int:
+    """Hermes preflight 消息估算，图片固定按约 1500 token 计算。"""
+    if not isinstance(messages, list):
+        return estimate_tokens_rough(messages)
+    total_chars = 0
+    image_tokens = 0
+    for message in messages:
+        total_chars += _estimate_message_chars(message)
+        if isinstance(message, Mapping):
+            image_tokens += _count_image_tokens(message, 1500)
+    return ((total_chars + 3) // 4) + image_tokens
 
 
 def estimate_request_tokens_rough(*, system: Any, messages: Any, tools: Any) -> int:
-    """粗估完整模型请求。"""
-    return estimate_tokens_rough({
-        "system": system,
-        "messages": messages,
-        "tools": tools,
-    })
+    """粗估完整请求，分别计入 system、messages 和工具 Schema。"""
+    total = 0
+    if system:
+        total += estimate_tokens_rough(system)
+    if messages:
+        total += estimate_messages_tokens_rough(messages)
+    if tools:
+        total += estimate_tokens_rough(tools)
+    return total
 
 
 @dataclass
@@ -169,6 +249,18 @@ class ContextState:
     def mark_compressed(self, estimated_input_tokens: int) -> None:
         """压缩后先使用粗估值，等待下一次 Provider usage 校准。"""
         self._current_input_tokens = max(0, estimated_input_tokens)
+
+    def restore_session_totals(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        current_input_tokens: int,
+    ) -> None:
+        """恢复持久会话统计；当前压力使用恢复请求的粗估值。"""
+        self.session_input_tokens = max(0, int(input_tokens))
+        self.session_output_tokens = max(0, int(output_tokens))
+        self._current_input_tokens = max(0, int(current_input_tokens))
 
     def update_from_response(
         self,

@@ -60,10 +60,32 @@ Provider 未返回 usage 时，Agent 会根据 system、消息历史和工具 sc
 主循环在 API 调用前使用粗估 token 检查，并在工具结果返回后使用真实 usage 再检查；
 摘要失败时原消息保持不变，连续无效压缩会停止触发。
 
+## 会话持久化与搜索
+
+会话状态默认保存在 `.hello-agent/state.db`。实现结构对齐 Hermes 的 `SessionDB`：SQLite
+使用 WAL 模式，`sessions` 保存会话元数据和 token 统计，`messages` 增量保存用户、模型及
+工具消息。与 Hermes CLI 一样，程序重启默认创建新会话；历史对话需要通过 `/resume`
+显式恢复。
+
+上下文压缩支持 Hermes 的两种持久化模式。默认在压缩后结束父会话并建立
+`parent_session_id` continuation；`compression.in_place: true` 则保持同一会话 ID，
+把旧消息标记为 `active=0, compacted=1`。两种模式都不会物理删除压缩前历史。
+
+REPL 支持：
+
+- `/new`：创建新会话。
+- `/sessions`：列出历史会话。
+- `/resume <id>`：恢复会话；父 ID 会自动定位到最新压缩 continuation。
+- `/search <关键词>`：使用 FTS5 搜索消息，中文子串使用 trigram 索引。
+- `/archive [id]`：归档指定会话，省略 ID 时归档当前会话。
+
+会话数据库路径、自动恢复和开关由 `config.yaml` 的 `session` 段控制；数据库及 WAL/SHM
+文件已排除在 Git 之外。
+
 ## 目录结构
 
 ```text
-agent/      对话循环、响应归一化、上下文压缩、工具执行与 guardrail
+agent/      对话循环、上下文压缩、SQLite 会话存储、工具执行与 guardrail
 tools/      可被模型调用的工具及权限检查
 tests/      guardrail 与工具调用链回归测试
 notebook/   实验与学习笔记

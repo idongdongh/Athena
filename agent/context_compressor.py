@@ -15,7 +15,7 @@ from collections.abc import Callable
 from typing import Any
 
 from agent.context_engine import ContextEngine
-from agent.context_state import estimate_tokens_rough
+from agent.context_state import estimate_messages_tokens_rough, estimate_tokens_rough
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -327,8 +327,9 @@ class ContextCompressor(ContextEngine):
         )
         if baseline <= 0:
             return False
+        growth = max(0, rough_tokens - baseline)
         tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
-        if rough_tokens - baseline > tolerated_growth:
+        if growth > tolerated_growth:
             return False
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
@@ -765,8 +766,8 @@ Write only the checkpoint body."""
             compress_end,
             summary,
         )
-        old_estimate = current_tokens or estimate_tokens_rough(messages)
-        new_estimate = estimate_tokens_rough(compressed)
+        old_estimate = current_tokens or estimate_messages_tokens_rough(messages)
+        new_estimate = estimate_messages_tokens_rough(compressed)
         savings_pct = (
             (old_estimate - new_estimate) / old_estimate * 100
             if old_estimate > 0
