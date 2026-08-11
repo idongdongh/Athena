@@ -49,7 +49,9 @@ tests/
 *.swp
 .zcode/
 
-# hello-agent 本地会话数据库及 WAL 辅助文件
+# Athena 本地会话数据库及 WAL 辅助文件
+.athena/
+# 旧版本状态目录：保留兼容，避免历史会话丢失
 .hello-agent/
 
 all_dataclass.py

@@ -14,7 +14,7 @@ from agent.session_db import SessionDB, new_session_id
 @dataclass(frozen=True)
 class SessionSettings:
     enabled: bool = True
-    database: str = ".hello-agent/state.db"
+    database: str = ".athena/state.db"
     # Hermes CLI 默认新建会话；只有显式 --continue/--resume 或 /resume 才恢复。
     auto_resume: bool = False
 
@@ -45,7 +45,14 @@ class SessionSettings:
 
     def resolve_database_path(self, project_root: Path) -> Path:
         path = Path(self.database).expanduser()
-        return path if path.is_absolute() else project_root / path
+        resolved = path if path.is_absolute() else project_root / path
+        # Athena 改名前的默认目录。旧库存在且新库尚未创建时继续复用，尤其避免
+        # SQLite WAL 尚未合并时复制/移动导致历史损坏。
+        if path == Path(".athena/state.db") and not resolved.exists():
+            legacy = project_root / ".hello-agent" / "state.db"
+            if legacy.exists():
+                return legacy
+        return resolved
 
 
 @dataclass

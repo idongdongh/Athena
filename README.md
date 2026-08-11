@@ -1,4 +1,4 @@
-# hello-agent
+# Athena
 
 一个基于 Anthropic 工具调用的轻量 coding agent。项目重点实现了可预测的工具失败处理
 和上下文状态管理：工具可以并发执行，但失败分类与共享状态始终按模型发出的顺序归并。
@@ -40,8 +40,8 @@ tool_use → preflight → handler（可并发）→ 主线程顺序归并
 任务已全部完成。
 
 工具循环阈值在项目根目录 `config.yaml` 的 `tool_loop_guardrails` 中配置。
-配置结构与 Hermes 一致，包含 `warnings_enabled`、`hard_stop_enabled`、
-`warn_after` 和 `hard_stop_after`。护栏不读取环境变量；配置在进程启动时读取一次，
+配置包含 `warnings_enabled`、`hard_stop_enabled`、`warn_after` 和
+`hard_stop_after`。护栏不读取环境变量；配置在进程启动时读取一次，
 修改后需要重启 Agent。配置文件或字段缺失时使用代码中的默认值。
 
 ## 上下文状态
@@ -54,20 +54,19 @@ Provider 未返回 usage 时，Agent 会根据 system、消息历史和工具 sc
 会扩大输出预算后有限重试。输出上限、上下文窗口、压缩阈值和续写次数在 `config.yaml`
 的 `model`、`context`、`compression` 段配置。
 
-上下文压缩的核心结构与 Hermes 对齐：`ContextEngine` 定义生命周期，
-`ContextCompressor` 执行旧工具结果裁剪、首部保护、token 预算尾部保护、中段结构化摘要、
+上下文压缩由 `ContextEngine` 定义生命周期，`ContextCompressor` 执行旧工具结果裁剪、
+首部保护、token 预算尾部保护、中段结构化摘要、
 迭代摘要和工具调用配对修复，`conversation_compression` 负责成功后原子替换历史。
 主循环在 API 调用前使用粗估 token 检查，并在工具结果返回后使用真实 usage 再检查；
 摘要失败时原消息保持不变，连续无效压缩会停止触发。
 
 ## 会话持久化与搜索
 
-会话状态默认保存在 `.hello-agent/state.db`。实现结构对齐 Hermes 的 `SessionDB`：SQLite
-使用 WAL 模式，`sessions` 保存会话元数据和 token 统计，`messages` 增量保存用户、模型及
-工具消息。与 Hermes CLI 一样，程序重启默认创建新会话；历史对话需要通过 `/resume`
-显式恢复。
+会话状态默认保存在 `.athena/state.db`。`SessionDB` 使用 SQLite WAL 模式，`sessions`
+保存会话元数据和 token 统计，`messages` 增量保存用户、模型及工具消息。程序重启默认
+创建新会话；历史对话需要通过 `/resume` 显式恢复。
 
-上下文压缩支持 Hermes 的两种持久化模式。默认在压缩后结束父会话并建立
+上下文压缩支持两种持久化模式。默认在压缩后结束父会话并建立
 `parent_session_id` continuation；`compression.in_place: true` 则保持同一会话 ID，
 把旧消息标记为 `active=0, compacted=1`。两种模式都不会物理删除压缩前历史。
 
@@ -81,6 +80,8 @@ REPL 支持：
 
 会话数据库路径、自动恢复和开关由 `config.yaml` 的 `session` 段控制；数据库及 WAL/SHM
 文件已排除在 Git 之外。
+
+旧版本创建的 `.hello-agent/state.db` 会被自动识别并继续复用，避免改名后丢失历史会话。
 
 ## 目录结构
 

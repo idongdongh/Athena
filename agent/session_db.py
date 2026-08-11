@@ -2,7 +2,7 @@
 
 保留 ``hermes_state.SessionDB`` 的单 Agent 核心：WAL、版本化 schema、
 增量消息、非破坏压缩、压缩链恢复和 FTS5 搜索。Gateway、计费、分支、
-多平台字段及数据库修复工具不属于 hello-agent 当前调用面。
+多平台字段及数据库修复工具不属于 Athena 当前调用面。
 """
 
 from __future__ import annotations
@@ -19,7 +19,8 @@ from typing import Any, TypeVar
 
 
 SCHEMA_VERSION = 1
-_CONTENT_JSON_PREFIX = "__hello_agent_json__:"
+_CONTENT_JSON_PREFIX = "__athena_json__:"
+_LEGACY_CONTENT_JSON_PREFIX = "__hello_agent_json__:"
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]{3,}")
 _WriteResult = TypeVar("_WriteResult")
 
@@ -191,7 +192,7 @@ class SessionDB:
                     )
                 elif int(row["version"]) > SCHEMA_VERSION:
                     raise RuntimeError(
-                        "state.db schema is newer than this hello-agent build: "
+                        "state.db schema is newer than this Athena build: "
                         f"{row['version']} > {SCHEMA_VERSION}"
                     )
                 self._conn.commit()
@@ -405,11 +406,14 @@ class SessionDB:
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
-        if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
-            try:
-                return json.loads(content[len(_CONTENT_JSON_PREFIX):])
-            except (json.JSONDecodeError, TypeError):
-                return content
+        if isinstance(content, str):
+            for prefix in (_CONTENT_JSON_PREFIX, _LEGACY_CONTENT_JSON_PREFIX):
+                if not content.startswith(prefix):
+                    continue
+                try:
+                    return json.loads(content[len(prefix):])
+                except (json.JSONDecodeError, TypeError):
+                    return content
         return content
 
     @staticmethod
