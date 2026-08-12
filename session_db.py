@@ -328,6 +328,30 @@ class SessionDB:
         session = self.get_session(session_id)
         return session.get("title") if session else None
 
+    def resolve_session_by_title(self, title: str) -> str | None:
+        """按完整标题优先、再按不区分大小写的子串解析最近会话。"""
+        normalized = title.strip().strip("`'\"")
+        if not normalized:
+            return None
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                """SELECT id FROM sessions
+                   WHERE archived = 0 AND title IS NOT NULL
+                     AND lower(title) = lower(?)
+                   ORDER BY started_at DESC LIMIT 1""",
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                row = self._conn.execute(
+                    """SELECT id FROM sessions
+                       WHERE archived = 0 AND title IS NOT NULL
+                         AND instr(lower(title), lower(?)) > 0
+                       ORDER BY started_at DESC LIMIT 1""",
+                    (normalized,),
+                ).fetchone()
+        return str(row["id"]) if row is not None else None
+
     def set_session_title(self, session_id: str, title: str) -> bool:
         normalized = title.strip()
         if not normalized:
@@ -703,6 +727,102 @@ class SessionDB:
             return session_id
         return tip
 
+    def get_lineage_root(self, session_id: str) -> str:
+        """沿压缩 continuation 的父指针找到根会话，损坏或成环时安全停止。"""
+        current = session_id
+        seen: set[str] = set()
+        with self._lock:
+            self._ensure_open()
+            for _ in range(32):
+                if current in seen:
+                    break
+                seen.add(current)
+                row = self._conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None or not row["parent_session_id"]:
+                    break
+                current = str(row["parent_session_id"])
+        return current
+
+    def get_messages_around(
+        self,
+        session_id: str,
+        message_id: int,
+        *,
+        window: int = 5,
+    ) -> dict[str, Any]:
+        """返回指定锚点前后窗口及两侧剩余消息数量。"""
+        safe_window = max(1, min(int(window), 20))
+        with self._lock:
+            self._ensure_open()
+            anchor = self._conn.execute(
+                "SELECT id FROM messages WHERE id = ? AND session_id = ?",
+                (int(message_id), session_id),
+            ).fetchone()
+            if anchor is None:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+            before = self._conn.execute(
+                """SELECT * FROM messages
+                   WHERE session_id = ? AND id < ? AND (active = 1 OR compacted = 1)
+                   ORDER BY id DESC LIMIT ?""",
+                (session_id, int(message_id), safe_window),
+            ).fetchall()
+            center = self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id = ?",
+                (session_id, int(message_id)),
+            ).fetchone()
+            after = self._conn.execute(
+                """SELECT * FROM messages
+                   WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1)
+                   ORDER BY id ASC LIMIT ?""",
+                (session_id, int(message_id), safe_window),
+            ).fetchall()
+            messages_before = self._conn.execute(
+                """SELECT COUNT(*) FROM messages
+                   WHERE session_id = ? AND id < ? AND (active = 1 OR compacted = 1)""",
+                (session_id, int(message_id)),
+            ).fetchone()[0]
+            messages_after = self._conn.execute(
+                """SELECT COUNT(*) FROM messages
+                   WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1)""",
+                (session_id, int(message_id)),
+            ).fetchone()[0]
+        rows = [*reversed(before), center, *after]
+        return {
+            "window": [self._decode_message_row(row) for row in rows if row is not None],
+            "messages_before": int(messages_before),
+            "messages_after": int(messages_after),
+        }
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        message_id: int,
+        *,
+        window: int = 5,
+        bookend: int = 3,
+    ) -> dict[str, Any]:
+        """组合会话首尾与命中窗口，供一次检索重建目标到结论。"""
+        view = self.get_messages_around(session_id, message_id, window=window)
+        messages = self.get_messages(session_id, include_inactive=True)
+        conversational = [m for m in messages if m.get("role") in {"user", "assistant"}]
+        safe_bookend = max(1, min(int(bookend), 10))
+        view["bookend_start"] = conversational[:safe_bookend]
+        view["bookend_end"] = conversational[-safe_bookend:]
+        return view
+
+    def _decode_message_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        message = dict(row)
+        message["content"] = self._decode_content(message.get("content"))
+        if message.get("tool_calls"):
+            try:
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                message["tool_calls"] = []
+        return message
+
     @staticmethod
     def _fts_phrase(query: str) -> str:
         normalized = " ".join(query.strip().split())
@@ -715,15 +835,31 @@ class SessionDB:
         query: str,
         *,
         limit: int = 20,
+        role_filter: list[str] | None = None,
+        sort: str | None = None,
     ) -> list[dict[str, Any]]:
         if not self._fts_enabled:
             raise RuntimeError("当前 SQLite 不支持 FTS5，会话保存与恢复仍可使用")
-        phrase = self._fts_phrase(query)
+        normalized = " ".join(query.strip().split())
+        phrase = normalized if re.search(r'\b(?:OR|NOT|AND)\b|["*()]', normalized) else self._fts_phrase(normalized)
         if not phrase:
             return []
         safe_limit = max(1, min(int(limit), 100))
         use_trigram = self._trigram_enabled and _CJK_RUN_RE.search(query) is not None
         table = "messages_fts_trigram" if use_trigram else "messages_fts"
+        roles = [role for role in (role_filter or []) if role in {"user", "assistant", "tool"}]
+        role_clause = ""
+        params: list[Any] = [phrase]
+        if roles:
+            placeholders = ",".join("?" for _ in roles)
+            role_clause = f" AND m.role IN ({placeholders})"
+            params.extend(roles)
+        order_clause = "rank, m.timestamp DESC"
+        if sort == "newest":
+            order_clause = "m.timestamp DESC, rank"
+        elif sort == "oldest":
+            order_clause = "m.timestamp ASC, rank"
+        params.append(safe_limit)
         with self._lock:
             self._ensure_open()
             try:
@@ -738,10 +874,13 @@ class SessionDB:
                         WHERE {table} MATCH ?
                           AND (m.active = 1 OR m.compacted = 1)
                           AND s.archived = 0
-                        ORDER BY rank, m.timestamp DESC
+                          {role_clause}
+                        ORDER BY {order_clause}
                         LIMIT ?""",
-                    (phrase, safe_limit),
+                    params,
                 ).fetchall()
             except sqlite3.OperationalError:
+                # FTS5 语法错误与普通未命中都按空结果处理，保持 CLI 既有契约；
+                # 调用方可调整关键词、使用 Browse 或按标题读取。
                 return []
             return [dict(row) for row in rows]

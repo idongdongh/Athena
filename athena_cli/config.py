@@ -68,3 +68,60 @@ class SessionSettings:
             if legacy.exists():
                 return legacy
         return resolved
+
+
+@dataclass(frozen=True)
+class MemorySettings:
+    """内置文件记忆配置。"""
+
+    memory_enabled: bool = False
+    user_profile_enabled: bool = False
+    memory_char_limit: int = 2200
+    user_char_limit: int = 1375
+    nudge_interval: int = 10
+    directory: str = "memories"
+
+    @classmethod
+    def from_mapping(cls, config: Mapping | None) -> "MemorySettings":
+        defaults = cls()
+        section = config.get("memory") if isinstance(config, Mapping) else None
+        if not isinstance(section, Mapping):
+            return defaults
+
+        def positive_int(name: str, default: int) -> int:
+            value = section.get(name)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else default
+
+        nudge_interval = section.get("nudge_interval")
+
+        directory = section.get("directory")
+        return cls(
+            memory_enabled=(
+                section["memory_enabled"]
+                if isinstance(section.get("memory_enabled"), bool)
+                else defaults.memory_enabled
+            ),
+            user_profile_enabled=(
+                section["user_profile_enabled"]
+                if isinstance(section.get("user_profile_enabled"), bool)
+                else defaults.user_profile_enabled
+            ),
+            memory_char_limit=positive_int("memory_char_limit", defaults.memory_char_limit),
+            user_char_limit=positive_int("user_char_limit", defaults.user_char_limit),
+            nudge_interval=(
+                nudge_interval
+                if isinstance(nudge_interval, int)
+                and not isinstance(nudge_interval, bool)
+                and nudge_interval >= 0
+                else defaults.nudge_interval
+            ),
+            directory=(
+                directory.strip()
+                if isinstance(directory, str) and directory.strip()
+                else defaults.directory
+            ),
+        )
+
+    def resolve_directory(self, project_root: Path) -> Path:
+        path = Path(self.directory).expanduser()
+        return path if path.is_absolute() else project_root / path

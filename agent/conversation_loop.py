@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 
 from anthropic.types import TextBlock, ToolUseBlock
 
-from tools.registry import registry, discover
+from tools.registry import registry
 from agent.context_compressor import ContextCompressor
 from agent.context_state import (
     ContextState,
@@ -113,10 +113,6 @@ def _on_interrupt(signum, frame):
     )
 
 
-# 触发所有工具文件自注册：默认扫描 tools/ 下含 registry.register(...) 的模块并 import，
-discover()
-
-
 def _assistant_text(res):
     """提取模型本轮回复里的文本块中的 text 并用 "" 拼接。"""
     return "".join(getattr(b, "text", "") for b in res.content
@@ -129,18 +125,22 @@ def _is_empty_model_response(res) -> bool:
     return not has_tool_call and not _assistant_text(res).strip()
 
 
-def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
+def _invalid_tool_results(
+    tool_calls: list[ToolUseBlock],
+    available_names: set[str] | None = None,
+) -> list[dict] | None:
     """发现未知工具时返回整批 synthetic results：
     1. 工具名为空："Tool call rejected: the tool name was empty. Use a valid name from the available tool list."
     2. 工具名不在可调用名单中：Unknown tool: {工具名称}. Available tools: {可用工具清单：工具1， 工具2， ....}
     3. 工具存在但这批次存在未知工具："Skipped: another tool call in this batch used an invalid name. Please retry this tool call."
 
     本批调用工具全部存在时返回 None。"""
-    invalid_names = {call.name for call in tool_calls if registry.get_entry(call.name) is None}
+    allowed = available_names if available_names is not None else set(registry.names())
+    invalid_names = {call.name for call in tool_calls if call.name not in allowed}
     if not invalid_names:
         return None
 
-    available = ", ".join(registry.names()) or "(none)"
+    available = ", ".join(sorted(allowed)) or "(none)"
     results = []
     for call in tool_calls:
         if call.name in invalid_names:
@@ -207,7 +207,7 @@ class _StreamWorker:
     # 取消后清空
     POST_CANCEL_DRAIN = 0.5
 
-    def __init__(self, stream_method, stream_kwargs, on_text, on_retry):
+    def __init__(self, stream_method, stream_kwargs, on_text, on_retry, controller=None):
         self._state_lock = threading.Lock()
         self._finished = threading.Event()
         self._request_cancelled = threading.Event() # 表示本次流式请求是否已被取消
@@ -223,11 +223,12 @@ class _StreamWorker:
         self._stream_kwargs = stream_kwargs
         self._on_text = on_text
         self._on_retry = on_retry
+        self._interrupt_controller = controller or interrupt_controller
 
     def _is_cancelled(self) -> bool:
         """检查流式请求信号和中断信号是否已触发"""
         # _request_cancelled 是本次请求的锁存信号：一旦设置为 True，在这次对象的生命周期里就保持 True，不会自动恢复
-        return self._request_cancelled.is_set() or interrupt_controller.is_requested()
+        return self._request_cancelled.is_set() or self._interrupt_controller.is_requested()
 
     def _consume_stream(self) -> None:
         manager = None
@@ -332,6 +333,7 @@ def _stream_message_with_recovery(
     *,
     client=None,
     on_text: Callable[[str], None] | None = None,
+    controller=None,
     **kwargs,
 ):
     """流式请求模型；中断时返回已生成的文本，不保留未完成的工具调用。
@@ -339,18 +341,25 @@ def _stream_message_with_recovery(
     流建立前的错误沿用 Provider 重试；流已经开始后不自动重放，避免重复输出。
     """
     active_client = client if client is not None else globals()["client"]
-    worker = _StreamWorker(active_client.messages.stream, kwargs, on_text, _on_retry)
+    active_controller = controller or interrupt_controller
+    worker = _StreamWorker(
+        active_client.messages.stream,
+        kwargs,
+        on_text,
+        _on_retry,
+        active_controller,
+    )
     worker.start()
 
     # 轮询检查中断状态
     while not worker.poll(_StreamWorker.POLL_INTERVAL):
-        if not interrupt_controller.is_requested():
+        if not active_controller.is_requested():
             continue
         worker.request_cancel()
         worker.close_active()
         break
 
-    if interrupt_controller.is_requested():
+    if active_controller.is_requested():
         worker.request_cancel()
         # 给 close 后的 worker 一个短暂收尾窗口；即使 Provider 不响应，daemon
         # worker 也不会阻止 REPL 立即返回或第二次 Ctrl+C 退出进程。
@@ -425,6 +434,7 @@ def _generate_context_summary(agent: "AIAgent", prompt: str, max_tokens: int) ->
     """使用当前模型生成压缩摘要；不提供工具，不接受截断或中断的摘要。"""
     res, interrupted = _stream_message_with_recovery(
         client=agent.client,
+        controller=getattr(agent, "interrupt_controller", interrupt_controller),
         model=agent.model,
         messages=[{"role": "user", "content": prompt}],
         system=(
@@ -484,6 +494,7 @@ def _run_context_compression(
         in_place=agent.context_settings.compression_in_place,
     )
     if result.changed:
+        agent.refresh_memory_snapshot()
         print(
             "\033[33m✓ 上下文压缩完成："
             f"{result.before_messages} → {result.after_messages} 条消息\033[0m"
@@ -515,6 +526,7 @@ def _request_summary(
     )
     res, interrupted = _stream_message_with_recovery(
         client=agent.client,
+        controller=getattr(agent, "interrupt_controller", interrupt_controller),
         model=agent.model,
         messages=messages,
         system=summary_system,
@@ -541,7 +553,8 @@ def run_conversation(
     stream_output: bool = False,
 ):
     global _last_interrupt_time
-    interrupt_controller.clear()
+    turn_interrupt = agent.interrupt_controller
+    turn_interrupt.clear()
     _last_interrupt_time = 0.0
     context_state = agent.context_state
     context_compressor = agent.context_compressor
@@ -555,8 +568,10 @@ def run_conversation(
     agent.file_mutation_tracker.reset_for_turn()
 
     # 仅在 loop 执行期间接管 Ctrl+C；结束后恢复进入 loop 前的 handler。
-    previous_sigint_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, _on_interrupt)
+    owns_sigint = threading.current_thread() is threading.main_thread()
+    previous_sigint_handler = signal.getsignal(signal.SIGINT) if owns_sigint else None
+    if owns_sigint:
+        signal.signal(signal.SIGINT, _on_interrupt)
 
     # 当前用户请求已经向模型发起的 API 调用次数，用于限制最大迭代轮数。
     api_call_count = 0
@@ -573,20 +588,23 @@ def run_conversation(
     truncated_response_retries = 0
     request_max_tokens = agent.context_settings.max_output_tokens
     compression_attempts_this_turn = 0
+    should_review_memory = agent.begin_memory_review_cycle()
 
     try:
-        while api_call_count < MAX_ITERATIONS and not interrupt_controller.is_requested():
+        while api_call_count < MAX_ITERATIONS and not turn_interrupt.is_requested():
             try:
                 agent.flush_new_messages(messages)
             except Exception as exc:
                 print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
-            tool_definitions = registry.definitions()
+            tool_definitions = agent.tool_definitions()
             rough_tokens = estimate_request_tokens_rough(
                 system=agent.system_prompt,
                 messages=messages,
                 tools=tool_definitions,
             )
             if (
+                not agent._is_background_review
+                and
                 agent.context_settings.compression_enabled
                 and compression_attempts_this_turn < agent.context_settings.max_compressions_per_turn
                 and context_compressor.should_compress_preflight(
@@ -603,12 +621,13 @@ def run_conversation(
                     current_tokens=rough_tokens,
                 )
                 compression_attempts_this_turn += 1
-                if interrupt_controller.is_requested():
+                if turn_interrupt.is_requested():
                     break
 
             api_call_count += 1
             res, stream_interrupted = _stream_message_with_recovery(
                 client=agent.client,
+                controller=turn_interrupt,
                 model=agent.model,
                 messages=messages,
                 system=agent.system_prompt,
@@ -762,7 +781,7 @@ def run_conversation(
                 outcome = TurnOutcome.UNSUPPORTED_STOP_REASON
                 break
             # 处理整个 loop 过程中的中断
-            if interrupt_controller.is_requested():
+            if turn_interrupt.is_requested():
                 # 不执行模型刚生成的工具调用，只保留它在暂停前已经输出的文本。
                 paused_content, is_placeholder = _paused_text_blocks(res.content)
                 messages[-1]["content"] = paused_content
@@ -779,7 +798,8 @@ def run_conversation(
             tool_calls = [
                 block for block in res.content if isinstance(block, ToolUseBlock)
             ]
-            invalid_results = _invalid_tool_results(tool_calls)
+            available_tool_names = {item.get("name", "") for item in tool_definitions}
+            invalid_results = _invalid_tool_results(tool_calls, available_tool_names)
             if invalid_results is not None:
                 invalid_tool_retries += 1
                 messages.append({"role": "user", "content": invalid_results})
@@ -799,15 +819,23 @@ def run_conversation(
 
             invalid_tool_retries = 0
 
+            if any(call.name == "memory" for call in tool_calls):
+                agent.note_memory_tool_call()
+                should_review_memory = False
+
             # 把本轮 tool_use 块交给执行引擎调度，结果回写 messages
             execute_tool_calls(
                 res.content,
                 messages,
                 concurrent=CONCURRENT_TOOLS,
                 max_workers=TOOL_MAX_WORKERS,
-                is_cancelled=interrupt_controller.is_requested,
+                is_cancelled=turn_interrupt.is_requested,
                 guardrails=agent.tool_guardrails,
                 mutation_tracker=agent.file_mutation_tracker,
+                memory_store=getattr(agent, "_memory_store", None),
+                session_db=getattr(agent, "session_db", None),
+                current_session_id=getattr(agent, "session_id", None),
+                show_progress=not agent._is_background_review,
             )
             prev_step_had_tool_calls = True
 
@@ -826,6 +854,8 @@ def run_conversation(
             # Hermes 的 post-response 触发：工具结果写回后，用本次真实 prompt usage
             # 判断是否立即压缩；下一轮 API 前仍会再走一次 rough preflight 兜底。
             if (
+                not agent._is_background_review
+                and
                 agent.context_settings.compression_enabled
                 and compression_attempts_this_turn < agent.context_settings.max_compressions_per_turn
                 and context_compressor.should_compress()
@@ -839,12 +869,12 @@ def run_conversation(
                     current_tokens=max(0, context_compressor.last_prompt_tokens),
                 )
                 compression_attempts_this_turn += 1
-                if interrupt_controller.is_requested():
+                if turn_interrupt.is_requested():
                     break
 
         # 主循环结束但还没确定 outcome → 要么 iter 预算耗尽，要么 iter 中收到中断。
         if outcome is None:
-            if interrupt_controller.is_requested():
+            if turn_interrupt.is_requested():
                 # 可能在工具执行期间收到暂停信号。工具结果已经写回时，补一条
                 # assistant 占位消息，保持下一轮请求的角色与工具协议完整。
                 if not messages or messages[-1].get("role") != "assistant":
@@ -891,9 +921,13 @@ def run_conversation(
             agent.flush_new_messages(messages)
         except Exception as exc:
             print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
-        signal.signal(signal.SIGINT, previous_sigint_handler)
-        interrupt_controller.clear()
+        if owns_sigint:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+        turn_interrupt.clear()
         _last_interrupt_time = 0.0
+
+    if outcome is TurnOutcome.COMPLETED and should_review_memory:
+        agent.spawn_background_memory_review(messages)
 
 
 def agent_loop(
@@ -944,6 +978,14 @@ def agent_loop(
             if session_runtime is not None
             else lambda _before, _after, **_kwargs: "test-session"
         ),
+        refresh_memory_snapshot=lambda: None,
+        begin_memory_review_cycle=lambda: False,
+        note_memory_tool_call=lambda: None,
+        spawn_background_memory_review=lambda _messages: False,
+        _memory_store=None,
+        _is_background_review=False,
+        interrupt_controller=interrupt_controller,
+        tool_definitions=registry.definitions,
     )
     # 兼容适配器实现了 run_conversation 所需的完整 AIAgent 窄接口。
     run_conversation(cast("AIAgent", adapter), messages, stream_output=stream_output)

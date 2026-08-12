@@ -19,6 +19,7 @@ COMMANDS = (
     CommandDef("archive"),
 )
 
+# 字典推导式:{"session": CommandDef("sessions", ("session",))}
 _COMMAND_BY_NAME = {
     alias: command
     for command in COMMANDS

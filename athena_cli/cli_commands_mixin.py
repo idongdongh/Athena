@@ -100,7 +100,11 @@ class CLICommandsMixin:
         if not argument:
             print("用法：/search <关键词>")
             return
-        matches = self._session_db.search_messages(argument)
+        try:
+            matches = self._session_db.search_messages(argument)
+        except (RuntimeError, ValueError) as exc:
+            print(f"会话搜索失败：{exc}")
+            return
         if not matches:
             print("没有找到匹配消息")
             return

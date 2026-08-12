@@ -116,3 +116,8 @@ def discover(tools_dir: Optional[Path] = None) -> List[str]:
         except Exception as e:  # 单个工具模块损坏不应拖垮整个 agent
             print(f"[tools] 跳过 {p.stem}: {e}")
     return loaded
+
+
+def ensure_tools_discovered() -> None:
+    """在读取工具 schema 或构建 tool-aware prompt 前完成幂等发现。"""
+    discover()

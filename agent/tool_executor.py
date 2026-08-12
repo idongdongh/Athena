@@ -251,13 +251,28 @@ def _value_matches_schema_type(value: Any, schema: dict) -> bool:
     return False
 
 
-def _execute_raw_tool_call(name: str, args: dict) -> RawToolExecution:
+def _execute_raw_tool_call(
+    name: str,
+    args: dict,
+    memory_store=None,
+    session_db=None,
+    current_session_id: str | None = None,
+) -> RawToolExecution:
     """只执行 handler，不分类结果，不访问任何共享状态。"""
     entry = registry.get_entry(name)
     if entry is None:
         return RawToolExecution(f"Unknown tool: {name}", UNKNOWN)
     try:
-        output = entry.handler(**args)
+        if name == "memory":
+            output = entry.handler(**args, store=memory_store)
+        elif name == "session_search":
+            output = entry.handler(
+                **args,
+                db=session_db,
+                current_session_id=current_session_id,
+            )
+        else:
+            output = entry.handler(**args)
     except ToolExecutionCancelled as exc:
         return RawToolExecution(
             f"[Tool execution cancelled: {exc}]",
@@ -474,7 +489,8 @@ def _prepare_args(calls) -> tuple[list[dict], list[ToolOutcome | None]]:
 
 
 def _run_one_or_cancelled(
-    call, args, preparation_error, is_cancelled, guardrails=None
+    call, args, preparation_error, is_cancelled, guardrails=None, memory_store=None,
+    session_db=None, current_session_id=None,
 ) -> ToolOutcome:
     """单步顺序执行：preflight → execute → 分类（不 finalize，由调用方统一做）。
 
@@ -486,7 +502,11 @@ def _run_one_or_cancelled(
         return preparation_error
     preflight = _preflight_call(call.name, args, guardrails)
     if preflight is None:
-        return _classify_raw_execution(call.name, _execute_raw_tool_call(call.name, args))
+        return _classify_raw_execution(
+            call.name, _execute_raw_tool_call(
+                call.name, args, memory_store, session_db, current_session_id
+            )
+        )
     return preflight
 
 
@@ -497,6 +517,9 @@ def _run_sequential(
     is_cancelled: Callable[[], bool],
     guardrails=None,
     mutation_tracker=None,
+    memory_store=None,
+    session_db=None,
+    current_session_id=None,
 ) -> list[ToolOutcome]:
     """逐个 preflight → execute → finalize。
 
@@ -506,7 +529,8 @@ def _run_sequential(
     outcomes: list[ToolOutcome] = []
     for call, args, prep_err in zip(calls, prepared_args, preparation_errors):
         outcome = _run_one_or_cancelled(
-            call, args, prep_err, is_cancelled, guardrails
+            call, args, prep_err, is_cancelled, guardrails, memory_store,
+            session_db, current_session_id,
         )
         outcomes.append(_finalize_outcome(
             outcome, args, guardrails, mutation_tracker
@@ -522,6 +546,9 @@ def _run_parallel(
     max_workers: int,
     guardrails=None,
     mutation_tracker=None,
+    memory_store=None,
+    session_db=None,
+    current_session_id=None,
 ) -> list[ToolOutcome]:
     """并发执行：批量 preflight 后用 ThreadPoolExecutor 跑 handler，最后主线程顺序 finalize。
 
@@ -550,7 +577,14 @@ def _run_parallel(
     if executable:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(executable))) as executor:
             futures = {
-                executor.submit(_execute_raw_tool_call, call.name, args): index
+                executor.submit(
+                    _execute_raw_tool_call,
+                    call.name,
+                    args,
+                    memory_store,
+                    session_db,
+                    current_session_id,
+                ): index
                 for index, call, args in executable
             }
             pending = set(futures)
@@ -599,6 +633,10 @@ def execute_tool_calls(
     is_cancelled: Callable[[], bool] = lambda: False,
     guardrails: ToolCallGuardrailController | None = None,
     mutation_tracker: FileMutationTracker | None = None,
+    memory_store=None,
+    session_db=None,
+    current_session_id: str | None = None,
+    show_progress: bool = True,
 ) -> None:
     """执行一批 tool_use，并按模型原顺序归并结果后写回 messages。"""
 
@@ -606,8 +644,9 @@ def execute_tool_calls(
     if not calls:
         return
 
-    for call in calls:
-        print(f"use_tool:\033[33m{call.name}\033[0m\n")
+    if show_progress:
+        for call in calls:
+            print(f"use_tool:\033[33m{call.name}\033[0m\n")
 
     prepared_args, preparation_errors = _prepare_args(calls)
 
@@ -618,12 +657,12 @@ def execute_tool_calls(
     if parallel:
         outcomes = _run_parallel(
             calls, prepared_args, preparation_errors, is_cancelled, max_workers,
-            guardrails, mutation_tracker,
+            guardrails, mutation_tracker, memory_store, session_db, current_session_id,
         )
     else:
         outcomes = _run_sequential(
             calls, prepared_args, preparation_errors, is_cancelled,
-            guardrails, mutation_tracker,
+            guardrails, mutation_tracker, memory_store, session_db, current_session_id,
         )
 
     results = [
