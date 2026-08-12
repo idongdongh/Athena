@@ -1,8 +1,7 @@
 """Hermes 风格的 SQLite 会话存储。
 
 保留 ``hermes_state.SessionDB`` 的单 Agent 核心：WAL、版本化 schema、
-增量消息、非破坏压缩、压缩链恢复和 FTS5 搜索。Gateway、计费、分支、
-多平台字段及数据库修复工具不属于 Athena 当前调用面。
+增量消息、非破坏压缩、压缩链恢复和 FTS5 搜索。
 """
 
 from __future__ import annotations
@@ -128,7 +127,7 @@ END;
 
 
 def new_session_id() -> str:
-    """生成与 Hermes 同形态的可排序会话 ID。"""
+    """生成可排序会话 ID，格式是：年月日_时分秒_uuid 前六位。"""
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     return f"{stamp}_{uuid.uuid4().hex[:6]}"
 
@@ -146,17 +145,19 @@ def _json_default(value: Any) -> Any:
 
 
 class SessionDB:
-    """SQLite-backed session storage，API 与 Hermes 核心子集对齐。"""
+    """SQLite 会话、消息、压缩链和全文检索存储。"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
+        # 创建 .athena 目录
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # 数据库连接对象是否已经关闭
         self._closed = False
+        # 数据库连接对象
         self._conn = sqlite3.connect(
             self.path,
             check_same_thread=False,
-            timeout=5.0,
         )
         self._conn.row_factory = sqlite3.Row
         self._fts_enabled = False
@@ -175,7 +176,6 @@ class SessionDB:
     def _configure_connection(self) -> None:
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.execute("PRAGMA busy_timeout = 5000")
             self._conn.execute("PRAGMA journal_mode = WAL")
 
     def _initialize_schema(self) -> None:
@@ -264,6 +264,7 @@ class SessionDB:
         source: str,
         **kwargs: Any,
     ) -> str:
+        """在 session 表中写入一条目，写入成返回 session_id，写入失败抛出异常"""
         model_config = kwargs.get("model_config")
         if model_config is not None and not isinstance(model_config, str):
             model_config = json.dumps(

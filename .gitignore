@@ -30,7 +30,6 @@ ENV/
 # rag.py 含个人桌面路径；test.py 是临时调试
 rag.py
 test.py
-AGENT_HANDOFF.md
 
 # notebook/ —— 整体不入库（演进日志 + 异同点对照是个人学习产物，
 # 含安全实现细节，公开会暴露权限闸门防御机制）
@@ -48,6 +47,7 @@ tests/
 .vscode/
 *.swp
 .zcode/
+AGENTS.md
 
 # Athena 本地会话数据库及 WAL 辅助文件
 .athena/

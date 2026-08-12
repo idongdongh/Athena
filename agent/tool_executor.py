@@ -16,11 +16,9 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, List
 
 from agent.file_mutation_tracker import FileMutationTracker
-from agent.config_loader import load_config
 from agent.interrupt_controller import ToolExecutionCancelled
 from agent.tool_guardrails import (
     IDEMPOTENT_TOOL_NAMES,
-    ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     append_toolguard_guidance,
     toolguard_synthetic_result,
@@ -39,13 +37,8 @@ from tools.registry import registry
 # 单次工具调用批次返回给模型的所有工具结果，最多允许占用 300,000 个字符
 TURN_BUDGET_CHARS = 300_000
 
-# 每条用户请求开始时由 conversation_loop 重置状态；配置在进程启动时读取一次。
-_project_config = load_config()
-tool_guardrails = ToolCallGuardrailController(
-    ToolCallGuardrailConfig.from_mapping(
-        _project_config.get("tool_loop_guardrails")
-    )
-)
+# 每条用户请求开始时由 conversation_loop 重置状态；入口可注入 YAML 配置。
+tool_guardrails = ToolCallGuardrailController()
 file_mutation_tracker = FileMutationTracker()
 
 _TOOL_ERROR_ROLE_TAG_RE = re.compile(
@@ -156,7 +149,11 @@ def _coerce_tool_value(value: str, expected_type: Any, schema: dict) -> Any:
             return False
         return value
 
-    expected_python_type = {"array": list, "object": dict}.get(expected_type)
+    expected_python_type = (
+        {"array": list, "object": dict}.get(expected_type)
+        if isinstance(expected_type, str)
+        else None
+    )
     if expected_python_type is not None:
         try:
             parsed = json.loads(value)
@@ -242,6 +239,8 @@ def _value_matches_schema_type(value: Any, schema: dict) -> bool:
         "null": type(None),
     }
     for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
         expected_python = python_types.get(candidate)
         if expected_python is None:
             continue
@@ -336,7 +335,11 @@ def _preflight_error_outcome(name: str, exc: Exception) -> ToolOutcome:
     )
 
 
-def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
+def _preflight_call(
+    name: str,
+    args: dict,
+    guardrails: ToolCallGuardrailController | None = None,
+) -> ToolOutcome | None:
     """调用前预检。
 
     1. 工具护栏 before_call
@@ -352,7 +355,8 @@ def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
         None 允许调用
     """
     try:
-        decision = tool_guardrails.before_call(name, args)
+        controller = guardrails or tool_guardrails
+        decision = controller.before_call(name, args)
         if not decision.allows_execution:
             content = toolguard_synthetic_result(decision)
             print(f"\033[33m⚠️  guardrail block: {decision.message}\033[0m")
@@ -380,10 +384,16 @@ def _preflight_call(name: str, args: dict) -> ToolOutcome | None:
         return _preflight_error_outcome(name, exc)
 
 
-def _finalize_outcome(outcome: ToolOutcome, args: dict) -> ToolOutcome:
+def _finalize_outcome(
+    outcome: ToolOutcome,
+    args: dict,
+    guardrails: ToolCallGuardrailController | None = None,
+    mutation_tracker: FileMutationTracker | None = None,
+) -> ToolOutcome:
     """最终确定结果：主线程顺序归并一个结果，更新所有 per-turn 共享状态。"""
     if outcome.status not in {BLOCKED, CANCELLED, UNKNOWN}:
-        decision = tool_guardrails.after_call(
+        controller = guardrails or tool_guardrails
+        decision = controller.after_call(
             outcome.tool_name,
             args,
             outcome.content,
@@ -399,7 +409,8 @@ def _finalize_outcome(outcome: ToolOutcome, args: dict) -> ToolOutcome:
             content=append_toolguard_guidance(outcome.content, decision),
         )
 
-    file_mutation_tracker.record(outcome, args)
+    tracker = mutation_tracker or file_mutation_tracker
+    tracker.record(outcome, args)
     return outcome
 
 
@@ -462,7 +473,9 @@ def _prepare_args(calls) -> tuple[list[dict], list[ToolOutcome | None]]:
     return prepared_args, preparation_errors
 
 
-def _run_one_or_cancelled(call, args, preparation_error, is_cancelled) -> ToolOutcome:
+def _run_one_or_cancelled(
+    call, args, preparation_error, is_cancelled, guardrails=None
+) -> ToolOutcome:
     """单步顺序执行：preflight → execute → 分类（不 finalize，由调用方统一做）。
 
     只有顺序路径使用这条流水线——并发路径要求 preflight 全部先完成、handler 并发跑。
@@ -471,7 +484,7 @@ def _run_one_or_cancelled(call, args, preparation_error, is_cancelled) -> ToolOu
         return _cancelled_outcome(call.name, "not started due to user interrupt")
     if preparation_error is not None:
         return preparation_error
-    preflight = _preflight_call(call.name, args)
+    preflight = _preflight_call(call.name, args, guardrails)
     if preflight is None:
         return _classify_raw_execution(call.name, _execute_raw_tool_call(call.name, args))
     return preflight
@@ -482,6 +495,8 @@ def _run_sequential(
     prepared_args: list[dict],
     preparation_errors: list[ToolOutcome | None],
     is_cancelled: Callable[[], bool],
+    guardrails=None,
+    mutation_tracker=None,
 ) -> list[ToolOutcome]:
     """逐个 preflight → execute → finalize。
 
@@ -490,8 +505,12 @@ def _run_sequential(
     """
     outcomes: list[ToolOutcome] = []
     for call, args, prep_err in zip(calls, prepared_args, preparation_errors):
-        outcome = _run_one_or_cancelled(call, args, prep_err, is_cancelled)
-        outcomes.append(_finalize_outcome(outcome, args))
+        outcome = _run_one_or_cancelled(
+            call, args, prep_err, is_cancelled, guardrails
+        )
+        outcomes.append(_finalize_outcome(
+            outcome, args, guardrails, mutation_tracker
+        ))
     return outcomes
 
 
@@ -501,6 +520,8 @@ def _run_parallel(
     preparation_errors: list[ToolOutcome | None],
     is_cancelled: Callable[[], bool],
     max_workers: int,
+    guardrails=None,
+    mutation_tracker=None,
 ) -> list[ToolOutcome]:
     """并发执行：批量 preflight 后用 ThreadPoolExecutor 跑 handler，最后主线程顺序 finalize。
 
@@ -520,7 +541,7 @@ def _run_parallel(
         if prep_err is not None:
             raw_outcomes[index] = prep_err
             continue
-        preflight = _preflight_call(call.name, args)
+        preflight = _preflight_call(call.name, args, guardrails)
         if preflight is None:
             executable.append((index, call, args))
         else:
@@ -564,7 +585,9 @@ def _run_parallel(
             outcome = _classify_raw_execution(call.name, raw_or_outcome)
         else:
             outcome = raw_or_outcome
-        outcomes.append(_finalize_outcome(outcome, args))
+        outcomes.append(_finalize_outcome(
+            outcome, args, guardrails, mutation_tracker
+        ))
     return outcomes
 
 
@@ -574,6 +597,8 @@ def execute_tool_calls(
     concurrent: bool = False,
     max_workers: int = 4,
     is_cancelled: Callable[[], bool] = lambda: False,
+    guardrails: ToolCallGuardrailController | None = None,
+    mutation_tracker: FileMutationTracker | None = None,
 ) -> None:
     """执行一批 tool_use，并按模型原顺序归并结果后写回 messages。"""
 
@@ -593,10 +618,12 @@ def execute_tool_calls(
     if parallel:
         outcomes = _run_parallel(
             calls, prepared_args, preparation_errors, is_cancelled, max_workers,
+            guardrails, mutation_tracker,
         )
     else:
         outcomes = _run_sequential(
             calls, prepared_args, preparation_errors, is_cancelled,
+            guardrails, mutation_tracker,
         )
 
     results = [

@@ -9,7 +9,17 @@ from typing import Any
 
 from agent.context_compressor import ContextCompressor
 from agent.context_state import ContextState, estimate_request_tokens_rough
-from agent.session_runtime import SessionRuntime
+from typing import Protocol
+
+
+class CompressionPersistence(Protocol):
+    def persist_compression(
+        self,
+        original_messages: list[dict[str, Any]],
+        compressed_messages: list[dict[str, Any]],
+        *,
+        in_place: bool,
+    ) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -29,7 +39,7 @@ def compress_context(
     system: str,
     tools: list[dict[str, Any]],
     current_tokens: int | None = None,
-    session_runtime: SessionRuntime | None = None,
+    session_runtime: CompressionPersistence | None = None,
     in_place: bool = False,
 ) -> CompressionResult:
     """执行一次压缩；只有成功产生新上下文后才原子替换 ``messages``。"""

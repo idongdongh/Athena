@@ -26,7 +26,7 @@ from tools._binary import BINARY_EXTS
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".idea", ".vscode", "dist", "build", ".hg", ".svn"}
 
 
-def _iter_files(root: Path, file_glob: str = None):
+def _iter_files(root: Path, file_glob: str | None = None):
     """遍历 root 下文本文件，跳过垃圾目录与二进制扩展名，可选 file_glob 过滤。"""
     for p in root.rglob("*"):
         interrupt_controller.raise_if_requested("search_files interrupted by user")
@@ -42,7 +42,7 @@ def _iter_files(root: Path, file_glob: str = None):
 
 
 def search_files(pattern: str, target: str = "content", path: str = ".",
-                 file_glob: str = None, limit: int = 50,
+                 file_glob: str | None = None, limit: int = 50,
                  output_mode: str = "content", context: int = 0) -> str:
     """搜文件内容或文件名，返回 JSON。"""
     root = resolve(path)

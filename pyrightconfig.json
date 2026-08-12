@@ -1,0 +1,15 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "agent",
+    "athena_cli",
+    "tools",
+    "cli.py",
+    "run_agent.py",
+    "session_db.py"
+  ],
+  "exclude": [
+    "**/__pycache__"
+  ]
+}

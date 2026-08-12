@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from pathlib import Path
+from dataclasses import dataclass
 
 import yaml
 
@@ -35,3 +36,35 @@ def load_config(path: Path | str | None = None) -> dict:
     if not isinstance(data, Mapping):
         raise RuntimeError(f"配置文件顶层必须是 mapping: {config_path}")
     return dict(data)
+
+
+@dataclass(frozen=True)
+class SessionSettings:
+    enabled: bool = True
+    database: str = ".athena/state.db"
+
+    @classmethod
+    def from_mapping(cls, config: Mapping | None) -> "SessionSettings":
+        defaults = cls()
+        section = config.get("session") if isinstance(config, Mapping) else None
+        if not isinstance(section, Mapping):
+            return defaults
+        enabled = section.get("enabled")
+        database = section.get("database")
+        return cls(
+            enabled=enabled if isinstance(enabled, bool) else defaults.enabled,
+            database=(
+                database.strip()
+                if isinstance(database, str) and database.strip()
+                else defaults.database
+            ),
+        )
+
+    def resolve_database_path(self, project_root: Path) -> Path:
+        path = Path(self.database).expanduser()
+        resolved = path if path.is_absolute() else project_root / path
+        if path == Path(".athena/state.db") and not resolved.exists():
+            legacy = project_root / ".hello-agent" / "state.db"
+            if legacy.exists():
+                return legacy
+        return resolved

@@ -1,29 +1,15 @@
-import os
 import signal
-import sys
 import threading
 import time
 from enum import Enum
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
-from anthropic import Anthropic
 from anthropic.types import TextBlock, ToolUseBlock
-from dotenv import load_dotenv
-from httpx import Timeout
-
-# 用于实现更好的命令行输入框
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
 
 from tools.registry import registry, discover
-from agent.config_loader import load_config
 from agent.context_compressor import ContextCompressor
 from agent.context_state import (
-    ContextSettings,
     ContextState,
     estimate_request_tokens_rough,
 )
@@ -36,75 +22,29 @@ from agent.provider_error_recovery import (
     classify_provider_error,
     request_with_retries,
 )
-from agent.session_runtime import SessionRuntime
-from agent.session_runtime import SessionSettings
-from agent.session_db import SessionDB
-from agent.session_commands import handle_session_command
-from agent.tool_executor import execute_tool_calls, file_mutation_tracker, tool_guardrails
+from agent import tool_executor
+from agent.tool_executor import execute_tool_calls, file_mutation_tracker
 
-load_dotenv(override=True)
+if TYPE_CHECKING:
+    from run_agent import AIAgent
 
-# 启动期校验：api_key/model 缺失时抛友好 RuntimeError
-# 兼容两套命名（API_KEY / ANTHROPIC_API_KEY），与 web_extract_tool.py 保持一致
-_api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("API_KEY")
-if not _api_key:
-    raise RuntimeError(
-        "ANTHROPIC_API_KEY（或 API_KEY）未设置。请在项目根 .env 配置后重试。"
-    )
-_model_id = os.getenv("MODEL_ID")
-if not _model_id:
-    raise RuntimeError(
-        "MODEL_ID 未设置。请在项目根 .env 配置后重试。"
-    )
-
-# 发送请求、等待/读取响应：最多 300 秒
-API_TIMEOUT = 300.0
-# 建立连接：最多 10 秒
-API_CONNECT_TIMEOUT = 10.0
-
-# 重试统一由 provider_error_recovery 管理，避免 SDK 内置重试与外层重试相乘。
-client = Anthropic(
-    base_url=os.getenv("BASE_URL"),
-    api_key=_api_key,
-    max_retries=0,
-    timeout=Timeout(timeout=API_TIMEOUT, connect=API_CONNECT_TIMEOUT),
-)
-MODEL_ID = _model_id
-_project_config = load_config()
-# 基于配置初始化一个 ContextSettings 对象
-CONTEXT_SETTINGS = ContextSettings.from_mapping(_project_config)
-SESSION_SETTINGS = SessionSettings.from_mapping(_project_config)
-
-
-def _build_system() -> str:
-    """组装 system prompt。
-
-    会话级只建一次（模块 import 时求值，整个会话复用）。当前精简版
-    只注入工作目录和基本工具策略，不动态拼接 Hermes 的 skills / memory 片段。
-    """
-    workdir = os.getcwd()
-    return (
-        f"You are a coding agent at {workdir}. Use tools to solve tasks. Act, don't explain."
-        "如果执行工具的过程用户拒绝了你的工具请求，你不应该绕过命令，而是向用户说明原因"
-    )
-
-
-SYSTEM = _build_system()
 # 最大迭代步数：达到上限后去掉 tools 做一次总结调用优雅收尾
 MAX_ITERATIONS = 90
+API_TIMEOUT = 300.0
+API_CONNECT_TIMEOUT = 10.0
 # 工具并发执行：仅工具名互不重复的只读调用会并行；bash、写操作和重复调用顺序执行。
 CONCURRENT_TOOLS = True
 # 并发线程池上限
 TOOL_MAX_WORKERS = 4
+# 旧的模块级测试接缝；产品入口只调用 ``run_conversation(agent, ...)``。
+client = None
+MAX_OUTPUT_TOKENS = 4096
+MAX_LENGTH_CONTINUATIONS = 2
+CONTEXT_WINDOW = 128000
+COMPRESSION_ENABLED = True
+MAX_COMPRESSIONS_PER_TURN = 2
+COMPRESSION_IN_PLACE = False
 # 模型输出与上下文参数统一来自 config.yaml；缺失或非法字段使用代码默认值。
-MAX_OUTPUT_TOKENS = CONTEXT_SETTINGS.max_output_tokens
-MAX_TOKENS_SUMMARY = CONTEXT_SETTINGS.max_output_tokens
-MAX_LENGTH_CONTINUATIONS = CONTEXT_SETTINGS.max_length_continuations
-CONTEXT_WINDOW = CONTEXT_SETTINGS.context_window
-COMPRESSION_ENABLED = CONTEXT_SETTINGS.compression_enabled
-MAX_COMPRESSIONS_PER_TURN = CONTEXT_SETTINGS.max_compressions_per_turn
-COMPRESSION_IN_PLACE = CONTEXT_SETTINGS.compression_in_place
-
 _LENGTH_CONTINUATION_PROMPT = (
     "Continue exactly where the previous response stopped. Do not repeat earlier text. "
     "Return plain text only and do not call tools."
@@ -139,6 +79,13 @@ _last_interrupt_time = 0.0
 FORCE_QUIT_WINDOW_SECONDS = 2.0
 
 
+def _handle_idle_ctrl_c(event) -> None:
+    """旧测试接缝；空闲输入处理属于 ``cli`` 模块。"""
+    from cli import _handle_idle_ctrl_c as handle
+
+    handle(event)
+
+
 # signum：信号编号，不同编号对应不同的中断机制
 # frame：栈帧，当前程序执行的快照
 def _on_interrupt(signum, frame):
@@ -164,29 +111,6 @@ def _on_interrupt(signum, frame):
         "\n\033[33m⚠️  Pause requested — keeping output generated so far... "
         "(Ctrl+C again within 2 seconds to quit)\033[0m"
     )
-
-
-def _handle_idle_ctrl_c(event) -> None:
-    """空闲 REPL 中，优先清空已有输入；空输入框才退出。"""
-    # event：事件对象；event.app：当前应用对象
-    buffer = event.app.current_buffer
-    if buffer.text:
-        # 清空输入缓冲区
-        buffer.reset()
-        # 请求刷新中断界面，因为内容已经清空
-        event.app.invalidate()
-        return
-    event.app.exit(exception=KeyboardInterrupt)
-
-
-def _create_repl_key_bindings() -> KeyBindings:
-    """创建 REPL 按键绑定：将 ctrl+c 与 _handle_idle_ctrl_c 函数绑定
-    _handle_idle_ctrl_c（处理空闲状态在 ctrl+c，就是用户输入状态）：优先清空已有输入；空输入框才退出
-    """
-    bindings = KeyBindings()
-    # 创建快捷键并绑定回调函数
-    bindings.add("c-c")(_handle_idle_ctrl_c)
-    return bindings
 
 
 # 触发所有工具文件自注册：默认扫描 tools/ 下含 registry.register(...) 的模块并 import，
@@ -243,9 +167,10 @@ def _invalid_tool_results(tool_calls: list[ToolUseBlock]) -> list[dict] | None:
     return results
 
 
-def _append_file_mutation_notice(messages) -> str:
+def _append_file_mutation_notice(messages, mutation_tracker=None) -> str:
     """在最终回答后追加仍未恢复的文件修改失败，避免模型过度声称完成。"""
-    notice = file_mutation_tracker.format_notice()
+    tracker = mutation_tracker or file_mutation_tracker
+    notice = tracker.format_notice()
     if not notice or not messages or messages[-1].get("role") != "assistant":
         return ""
     # 必须修改同一条 assistant 消息：相邻的 assistant 消息会破坏 API 的角色交替约束。
@@ -405,6 +330,7 @@ class _StreamWorker:
 
 def _stream_message_with_recovery(
     *,
+    client=None,
     on_text: Callable[[str], None] | None = None,
     **kwargs,
 ):
@@ -412,7 +338,8 @@ def _stream_message_with_recovery(
 
     流建立前的错误沿用 Provider 重试；流已经开始后不自动重放，避免重复输出。
     """
-    worker = _StreamWorker(client.messages.stream, kwargs, on_text, _on_retry)
+    active_client = client if client is not None else globals()["client"]
+    worker = _StreamWorker(active_client.messages.stream, kwargs, on_text, _on_retry)
     worker.start()
 
     # 轮询检查中断状态
@@ -494,10 +421,11 @@ def _append_to_last_assistant(messages, text: str, *, stream_output: bool) -> No
         print(text)
 
 
-def _generate_context_summary(prompt: str, max_tokens: int) -> str:
+def _generate_context_summary(agent: "AIAgent", prompt: str, max_tokens: int) -> str:
     """使用当前模型生成压缩摘要；不提供工具，不接受截断或中断的摘要。"""
     res, interrupted = _stream_message_with_recovery(
-        model=MODEL_ID,
+        client=agent.client,
+        model=agent.model,
         messages=[{"role": "user", "content": prompt}],
         system=(
             "You compact coding-agent conversation history into a precise checkpoint. "
@@ -518,28 +446,30 @@ def _generate_context_summary(prompt: str, max_tokens: int) -> str:
     return summary
 
 
-def _create_context_compressor() -> ContextCompressor:
+def create_context_compressor(agent: "AIAgent") -> ContextCompressor:
     """按 config.yaml 创建本会话唯一的内置压缩器。"""
     return ContextCompressor(
-        context_length=CONTEXT_SETTINGS.context_window,
-        max_tokens=CONTEXT_SETTINGS.max_output_tokens,
-        threshold_percent=CONTEXT_SETTINGS.compression_threshold,
-        protect_first_n=CONTEXT_SETTINGS.protect_first_n,
-        protect_last_n=CONTEXT_SETTINGS.protect_last_n,
-        summary_target_ratio=CONTEXT_SETTINGS.compression_target_ratio,
-        abort_on_summary_failure=CONTEXT_SETTINGS.abort_on_summary_failure,
-        summary_callback=_generate_context_summary,
+        context_length=agent.context_settings.context_window,
+        max_tokens=agent.context_settings.max_output_tokens,
+        threshold_percent=agent.context_settings.compression_threshold,
+        protect_first_n=agent.context_settings.protect_first_n,
+        protect_last_n=agent.context_settings.protect_last_n,
+        summary_target_ratio=agent.context_settings.compression_target_ratio,
+        abort_on_summary_failure=agent.context_settings.abort_on_summary_failure,
+        summary_callback=lambda prompt, budget: _generate_context_summary(
+            agent, prompt, budget
+        ),
     )
 
 
 def _run_context_compression(
+    agent: "AIAgent",
     messages,
     *,
     context_state: ContextState,
     context_compressor: ContextCompressor,
     tool_definitions: list[dict],
     current_tokens: int,
-    session_runtime: SessionRuntime | None = None,
 ) -> bool:
     """执行一次压缩并显示结果；返回是否真正替换了历史。"""
     print("\n\033[33m⟳ 正在压缩较早的对话上下文...\033[0m")
@@ -547,11 +477,11 @@ def _run_context_compression(
         context_compressor,
         context_state,
         messages,
-        system=SYSTEM,
+        system=agent.system_prompt,
         tools=tool_definitions,
         current_tokens=current_tokens,
-        session_runtime=session_runtime,
-        in_place=COMPRESSION_IN_PLACE,
+        session_runtime=agent,
+        in_place=agent.context_settings.compression_in_place,
     )
     if result.changed:
         print(
@@ -568,6 +498,7 @@ def _run_context_compression(
 
 
 def _request_summary(
+    agent: "AIAgent",
     messages,
     *,
     stream_output: bool,
@@ -578,15 +509,16 @@ def _request_summary(
     # 真正的 api_call_count 由调用方在调用 _request_summary 之前已 ++
     print(f"\n\033[33m⚠️  {label} — requesting summary...\033[0m")
     summary_system = (
-        SYSTEM
+        agent.system_prompt
         + "\nThe tool iteration budget is exhausted. Reply with a concise plain-text "
         "summary only. Do not call tools or emit tool-call markup."
     )
     res, interrupted = _stream_message_with_recovery(
-        model=MODEL_ID,  # type: ignore
+        client=agent.client,
+        model=agent.model,
         messages=messages,
         system=summary_system,
-        max_tokens=MAX_TOKENS_SUMMARY,
+        max_tokens=agent.context_settings.max_output_tokens,
         # 打印流式输出
         on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
     )
@@ -602,50 +534,25 @@ def _request_summary(
     messages.append({"role": "assistant", "content": res.content})
 
 
-def _restore_context_components(
-    runtime: SessionRuntime,
-    messages: list[dict[str, Any]],
-) -> tuple[ContextState, ContextCompressor]:
-    """根据持久会话重建派生 token 状态；消息内容只使用传入的 history。"""
-    context_state = ContextState.from_settings(CONTEXT_SETTINGS)
-    session = runtime.db.get_session(runtime.session_id) or {}
-    current_tokens = estimate_request_tokens_rough(
-        system=SYSTEM,
-        messages=messages,
-        tools=registry.definitions(),
-    )
-    context_state.restore_session_totals(
-        input_tokens=int(session.get("input_tokens") or 0),
-        output_tokens=int(session.get("output_tokens") or 0),
-        current_input_tokens=current_tokens,
-    )
-    compressor = _create_context_compressor()
-    context_state._context_compressor = compressor
-    return context_state, compressor
-
-
-def agent_loop(
+def run_conversation(
+    agent: "AIAgent",
     messages,
     *,
     stream_output: bool = False,
-    context_state: ContextState | None = None,
-    context_compressor: ContextCompressor | None = None,
-    session_runtime: SessionRuntime | None = None,
 ):
     global _last_interrupt_time
     interrupt_controller.clear()
     _last_interrupt_time = 0.0
-    if context_state is None:
-        context_state = ContextState.from_settings(CONTEXT_SETTINGS)
+    context_state = agent.context_state
+    context_compressor = agent.context_compressor
     if context_compressor is None:
-        context_compressor = context_state._context_compressor
-        if context_compressor is None:
-            context_compressor = _create_context_compressor()
-            context_state._context_compressor = context_compressor
+        context_compressor = create_context_compressor(agent)
+        context_state._context_compressor = context_compressor
+        agent.context_compressor = context_compressor
 
     # 每条用户请求开始时，重置重复调用计数、halt 锁存、文件修改失败记录。
-    tool_guardrails.reset_for_turn()
-    file_mutation_tracker.reset_for_turn()
+    agent.tool_guardrails.reset_for_turn()
+    agent.file_mutation_tracker.reset_for_turn()
 
     # 仅在 loop 执行期间接管 Ctrl+C；结束后恢复进入 loop 前的 handler。
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -664,37 +571,36 @@ def agent_loop(
     # 纯文本截断和工具调用截断分别有界重试，互不混用计数。
     length_continuations = 0
     truncated_response_retries = 0
-    request_max_tokens = MAX_OUTPUT_TOKENS
+    request_max_tokens = agent.context_settings.max_output_tokens
     compression_attempts_this_turn = 0
 
     try:
         while api_call_count < MAX_ITERATIONS and not interrupt_controller.is_requested():
-            if session_runtime is not None:
-                try:
-                    session_runtime.flush_new_messages(messages)
-                except Exception as exc:
-                    print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
+            try:
+                agent.flush_new_messages(messages)
+            except Exception as exc:
+                print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
             tool_definitions = registry.definitions()
             rough_tokens = estimate_request_tokens_rough(
-                system=SYSTEM,
+                system=agent.system_prompt,
                 messages=messages,
                 tools=tool_definitions,
             )
             if (
-                COMPRESSION_ENABLED
-                and compression_attempts_this_turn < MAX_COMPRESSIONS_PER_TURN
+                agent.context_settings.compression_enabled
+                and compression_attempts_this_turn < agent.context_settings.max_compressions_per_turn
                 and context_compressor.should_compress_preflight(
                     messages,
                     rough_tokens=rough_tokens,
                 )
             ):
                 _run_context_compression(
+                    agent,
                     messages,
                     context_state=context_state,
                     context_compressor=context_compressor,
                     tool_definitions=tool_definitions,
                     current_tokens=rough_tokens,
-                    session_runtime=session_runtime,
                 )
                 compression_attempts_this_turn += 1
                 if interrupt_controller.is_requested():
@@ -702,9 +608,10 @@ def agent_loop(
 
             api_call_count += 1
             res, stream_interrupted = _stream_message_with_recovery(
-                model=MODEL_ID,
+                client=agent.client,
+                model=agent.model,
                 messages=messages,
-                system=SYSTEM,
+                system=agent.system_prompt,
                 max_tokens=request_max_tokens,
                 tools=tool_definitions,
                 on_text=(lambda text: print(text, end="", flush=True)) if stream_output else None,
@@ -728,7 +635,7 @@ def agent_loop(
             response_state = inspect_model_response(res)
             usage = context_state.update_from_response(
                 response_state,
-                system=SYSTEM,
+                system=agent.system_prompt,
                 messages=messages,
                 tools=tool_definitions,
                 response_content=res.content,
@@ -739,11 +646,10 @@ def agent_loop(
                 "total_tokens": usage.effective_input_tokens + usage.output_tokens,
                 "estimated": usage.estimated,
             })
-            if session_runtime is not None:
-                try:
-                    session_runtime.record_usage(usage)
-                except Exception as exc:
-                    print(f"\n\033[33m⚠️  会话 usage 保存失败：{exc}\033[0m")
+            try:
+                agent.record_usage(usage)
+            except Exception as exc:
+                print(f"\n\033[33m⚠️  会话 usage 保存失败：{exc}\033[0m")
 
             # 长度终止必须先于空回复和普通完成处理。截断的工具参数不可信，
             # 因此不写入历史也不执行，只提高输出预算后重试同一个请求。
@@ -752,17 +658,17 @@ def agent_loop(
                     truncated_kind = (
                         "工具调用" if response_state.has_tool_calls else "空响应"
                     )
-                    if truncated_response_retries < MAX_LENGTH_CONTINUATIONS:
+                    if truncated_response_retries < agent.context_settings.max_length_continuations:
                         truncated_response_retries += 1
                         request_max_tokens = min(
-                            MAX_OUTPUT_TOKENS * (truncated_response_retries + 1),
-                            CONTEXT_WINDOW,
+                            agent.context_settings.max_output_tokens * (truncated_response_retries + 1),
+                            agent.context_settings.context_window,
                         )
                         print(
                             f"\033[33m⚠️  模型{truncated_kind}被截断"
                             + ("，未执行" if response_state.has_tool_calls else "")
                             + "；正在扩大输出预算重试 "
-                            f"（{truncated_response_retries}/{MAX_LENGTH_CONTINUATIONS}）\033[0m"
+                            f"（{truncated_response_retries}/{agent.context_settings.max_length_continuations}）\033[0m"
                         )
                         continue
                     stopped_text = (
@@ -780,7 +686,7 @@ def agent_loop(
 
                 messages.append({"role": "assistant", "content": res.content})
                 prev_step_had_tool_calls = False
-                if length_continuations < MAX_LENGTH_CONTINUATIONS:
+                if length_continuations < agent.context_settings.max_length_continuations:
                     length_continuations += 1
                     messages.append({
                         "role": "user",
@@ -788,7 +694,7 @@ def agent_loop(
                     })
                     print(
                         "\033[33m⚠️  模型文本达到输出上限，正在从断点继续 "
-                        f"（{length_continuations}/{MAX_LENGTH_CONTINUATIONS}）\033[0m"
+                        f"（{length_continuations}/{agent.context_settings.max_length_continuations}）\033[0m"
                     )
                     continue
                 _append_to_last_assistant(
@@ -828,7 +734,7 @@ def agent_loop(
 
             messages.append({"role": "assistant", "content": res.content})
             prev_step_had_tool_calls = False
-            request_max_tokens = MAX_OUTPUT_TOKENS
+            request_max_tokens = agent.context_settings.max_output_tokens
             truncated_response_retries = 0
 
             if response_state.stop_reason in {
@@ -900,10 +806,12 @@ def agent_loop(
                 concurrent=CONCURRENT_TOOLS,
                 max_workers=TOOL_MAX_WORKERS,
                 is_cancelled=interrupt_controller.is_requested,
+                guardrails=agent.tool_guardrails,
+                mutation_tracker=agent.file_mutation_tracker,
             )
             prev_step_had_tool_calls = True
 
-            halt_decision = tool_guardrails.halt_decision
+            halt_decision = agent.tool_guardrails.halt_decision
             # 只允许第一次写入，后面即使工具调用成功，也无法修改
             if halt_decision is not None:
                 halt_text = f"工具调用已停止：{halt_decision.message}"
@@ -918,17 +826,17 @@ def agent_loop(
             # Hermes 的 post-response 触发：工具结果写回后，用本次真实 prompt usage
             # 判断是否立即压缩；下一轮 API 前仍会再走一次 rough preflight 兜底。
             if (
-                COMPRESSION_ENABLED
-                and compression_attempts_this_turn < MAX_COMPRESSIONS_PER_TURN
+                agent.context_settings.compression_enabled
+                and compression_attempts_this_turn < agent.context_settings.max_compressions_per_turn
                 and context_compressor.should_compress()
             ):
                 _run_context_compression(
+                    agent,
                     messages,
                     context_state=context_state,
                     context_compressor=context_compressor,
                     tool_definitions=tool_definitions,
                     current_tokens=max(0, context_compressor.last_prompt_tokens),
-                    session_runtime=session_runtime,
                 )
                 compression_attempts_this_turn += 1
                 if interrupt_controller.is_requested():
@@ -956,12 +864,13 @@ def agent_loop(
         # summary 不算入 api_call_count——它本质上是"预算耗尽"事件的副作用。
         if outcome.needs_summary:
             _request_summary(
+                agent,
                 messages,
                 stream_output=stream_output,
                 context_state=context_state,
             )
 
-        notice = _append_file_mutation_notice(messages)
+        notice = _append_file_mutation_notice(messages, agent.file_mutation_tracker)
         if stream_output and notice:
             print(notice)
 
@@ -978,127 +887,63 @@ def agent_loop(
             message += f"：{detail}"
         _emit_assistant_message(messages, message, stream_output=stream_output)
     finally:
-        if session_runtime is not None:
-            try:
-                session_runtime.flush_new_messages(messages)
-            except Exception as exc:
-                print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
+        try:
+            agent.flush_new_messages(messages)
+        except Exception as exc:
+            print(f"\n\033[33m⚠️  会话保存失败：{exc}\033[0m")
         signal.signal(signal.SIGINT, previous_sigint_handler)
         interrupt_controller.clear()
         _last_interrupt_time = 0.0
 
 
-if __name__ == "__main__":
-    # 历史消息列表
-    history = []
-    session_context = ContextState.from_settings(CONTEXT_SETTINGS)
-    session_compressor = _create_context_compressor()
-    session_db: SessionDB | None = None
-    session_runtime: SessionRuntime | None = None
-    if SESSION_SETTINGS.enabled:
-        try:
-            project_root = Path(__file__).resolve().parents[1]
-            session_db = SessionDB(
-                SESSION_SETTINGS.resolve_database_path(project_root)
-            )
-            recent_sessions = session_db.list_sessions_rich(limit=1)
-            if SESSION_SETTINGS.auto_resume and recent_sessions:
-                session_runtime, history = SessionRuntime.resume(
-                    session_db,
-                    recent_sessions[0]["id"],
-                )
-                print(f"\033[90m已恢复会话：{session_runtime.session_id}\033[0m")
-            else:
-                session_runtime = SessionRuntime.start(
-                    session_db,
-                    model=MODEL_ID,
-                    model_config={"max_output_tokens": MAX_OUTPUT_TOKENS},
-                    system_prompt=SYSTEM,
-                )
-            session_context, session_compressor = _restore_context_components(
-                session_runtime,
-                history,
-            )
-        except Exception as exc:
-            if session_db is not None:
-                session_db.close()
-            session_db = None
-            session_runtime = None
-            print(f"\033[33m⚠️  会话数据库初始化失败，改用内存模式：{exc}\033[0m")
-    # prompt_toolkit 能正确处理中文宽字符、光标移动和历史输入。
-    prompt_session = (
-        PromptSession(
-            # 用于实现命令历史记录功能
-            history=InMemoryHistory(),
-            # 一次 ctrl+c 清空内容，两次退出程序
-            key_bindings=_create_repl_key_bindings(),
-        )
-        # 判断程序的标准输入流式是否是终端
-        if sys.stdin.isatty()
-        else None
+def agent_loop(
+    messages,
+    *,
+    stream_output: bool = False,
+    context_state: ContextState | None = None,
+    context_compressor: ContextCompressor | None = None,
+    session_runtime=None,
+):
+    """旧测试入口；生产代码使用 ``AIAgent.run_conversation``。
+
+    该适配器不读取配置或创建数据库，只把旧参数组合成新循环所需的 Agent 接口。
+    """
+    from agent.context_state import ContextSettings
+
+    settings = ContextSettings(
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        max_length_continuations=MAX_LENGTH_CONTINUATIONS,
+        context_window=CONTEXT_WINDOW,
+        compression_enabled=COMPRESSION_ENABLED,
+        max_compressions_per_turn=MAX_COMPRESSIONS_PER_TURN,
+        compression_in_place=COMPRESSION_IN_PLACE,
     )
-    # REPL：交互式循环
-    while True:
-        # 第二次 Ctrl+C 抛出的 KeyboardInterrupt。
-        try:
-            if prompt_session is not None:
-                query = prompt_session.prompt(ANSI("\033[33m >> \033[0m"))
-            else:
-                # 管道输入不是交互终端，保留 input() 以支持脚本和 smoke test。
-                query = input("\033[33m >> \033[0m")
-
-            if session_db is not None and session_runtime is not None:
-                try:
-                    command_result = handle_session_command(
-                        query,
-                        db=session_db,
-                        runtime=session_runtime,
-                        model=MODEL_ID,
-                        system_prompt=SYSTEM,
-                    )
-                except (KeyError, ValueError) as exc:
-                    print(f"\033[33m⚠️  {exc}\033[0m")
-                    continue
-                if command_result.handled:
-                    if command_result.output:
-                        print(command_result.output)
-                    if command_result.runtime is not None:
-                        session_runtime = command_result.runtime
-                    if command_result.messages is not None:
-                        history = command_result.messages
-                    if command_result.reset_context:
-                        session_context, session_compressor = (
-                            _restore_context_components(session_runtime, history)
-                        )
-                    continue
-                if query.strip().startswith("/"):
-                    print(
-                        f"未知命令：{query.strip().split()[0]}。"
-                        "可用会话命令：/new、/sessions、/resume、/search、/archive"
-                    )
-                    continue
-
-            # 将用户 query 追加到历史消息列表中
-            history.append({"role": "user", "content": query})
-
-            agent_loop(
-                history,
-                stream_output=True,
-                context_state=session_context,
-                context_compressor=session_compressor,
-                session_runtime=session_runtime,
-            )
-        except EOFError:
-            print("\n输入结束，退出交互")
-            break
-        except KeyboardInterrupt:
-            print("\n收到 Ctrl+C，退出交互")
-            break
-    if session_runtime is not None:
-        try:
-            session_runtime.flush_new_messages(history)
-            session_runtime.end("user_exit")
-        except Exception as exc:
-            print(f"\033[33m⚠️  退出时保存会话失败：{exc}\033[0m")
-    if session_db is not None:
-        session_db.close()
+    state = context_state or ContextState.from_settings(settings)
+    adapter = SimpleNamespace(
+        client=client,
+        model="test-model",
+        system_prompt="test-system",
+        context_settings=settings,
+        context_state=state,
+        context_compressor=context_compressor,
+        tool_guardrails=tool_executor.tool_guardrails,
+        file_mutation_tracker=file_mutation_tracker,
+        session_id=getattr(session_runtime, "session_id", "test-session"),
+        flush_new_messages=(
+            session_runtime.flush_new_messages
+            if session_runtime is not None
+            else lambda _messages: 0
+        ),
+        record_usage=(
+            session_runtime.record_usage
+            if session_runtime is not None
+            else lambda _usage: None
+        ),
+        persist_compression=(
+            session_runtime.persist_compression
+            if session_runtime is not None
+            else lambda _before, _after, **_kwargs: "test-session"
+        ),
+    )
+    # 兼容适配器实现了 run_conversation 所需的完整 AIAgent 窄接口。
+    run_conversation(cast("AIAgent", adapter), messages, stream_output=stream_output)

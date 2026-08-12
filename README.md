@@ -7,7 +7,7 @@
 
 1. 在 `.env` 配置 `ANTHROPIC_API_KEY`（或 `API_KEY`）和 `MODEL_ID`。
 2. 按 `requirements.txt` 创建环境并安装依赖。
-3. 运行 `python -m agent.conversation_loop`。
+3. 运行 `python cli.py`。
 
 模型回复会流式显示。任务运行期间第一次按 `Ctrl+C` 会主动关闭当前模型流、
 终止正在运行的 bash 进程组，并保留模型已经输出的文本；2 秒内再次按下会退出
@@ -78,17 +78,20 @@ REPL 支持：
 - `/search <关键词>`：使用 FTS5 搜索消息，中文子串使用 trigram 索引。
 - `/archive [id]`：归档指定会话，省略 ID 时归档当前会话。
 
-会话数据库路径、自动恢复和开关由 `config.yaml` 的 `session` 段控制；数据库及 WAL/SHM
-文件已排除在 Git 之外。
+会话数据库路径和开关由 `config.yaml` 的 `session` 段控制；数据库及 WAL/SHM 文件已排除
+在 Git 之外。普通启动始终创建新会话，只有显式 `/resume` 才恢复历史会话。
 
 旧版本创建的 `.hello-agent/state.db` 会被自动识别并继续复用，避免改名后丢失历史会话。
 
 ## 目录结构
 
 ```text
-agent/      对话循环、上下文压缩、SQLite 会话存储、工具执行与 guardrail
-tools/      可被模型调用的工具及权限检查
-tests/      guardrail 与工具调用链回归测试
-notebook/   实验与学习笔记
-rag.py      独立的 RAG 实验入口
+cli.py        经典交互式 CLI 入口与 AthenaCLI 编排器
+run_agent.py  AIAgent 会话状态和 Agent 内核适配入口
+session_db.py SQLite 会话存储、压缩链和全文搜索
+athena_cli/   CLI 配置、斜杠命令、会话列表和 Agent 初始化
+agent/        对话循环、上下文压缩、工具执行与 guardrail
+tools/        可被模型调用的工具及权限检查
+tests/        本地回归测试（不发布到远端）
+notebook/     本地实验与学习笔记（不发布到远端）
 ```
