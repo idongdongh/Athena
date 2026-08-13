@@ -192,9 +192,6 @@ uv run python -m unittest discover -s tests
 uv run python -m compileall -q agent athena_cli tools cli.py run_agent.py session_db.py
 ```
 
-测试源码随项目发布，便于验证关键行为和防止后续重构回归；缓存、覆盖率报告和临时数据
-不会提交到 Git。
-
 ## 目录结构
 
 ```text
@@ -204,5 +201,5 @@ session_db.py SQLite 会话存储、压缩链和全文搜索
 athena_cli/   CLI 配置、斜杠命令、会话列表和 Agent 初始化
 agent/        对话循环、上下文压缩、工具执行与 guardrail
 tools/        模型可调用工具及其权限和安全检查
-tests/        本地回归测试
+tests/        单元测试
 ```
