@@ -36,7 +36,11 @@ test.py
 notebook/
 
 # 本地回归测试，不发布到远端仓库
-tests/
+# 测试源码随项目发布；只忽略测试运行产物
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
 
 # .DS_Store（macOS 系统文件）
 .DS_Store

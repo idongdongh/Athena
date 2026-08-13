@@ -192,7 +192,8 @@ uv run python -m unittest discover -s tests
 uv run python -m compileall -q agent athena_cli tools cli.py run_agent.py session_db.py
 ```
 
-测试目录仅用于本地回归，不发布到远端。
+测试源码随项目发布，便于验证关键行为和防止后续重构回归；缓存、覆盖率报告和临时数据
+不会提交到 Git。
 
 ## 目录结构
 
