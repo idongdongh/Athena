@@ -203,6 +203,5 @@ session_db.py SQLite 会话存储、压缩链和全文搜索
 athena_cli/   CLI 配置、斜杠命令、会话列表和 Agent 初始化
 agent/        对话循环、上下文压缩、工具执行与 guardrail
 tools/        模型可调用工具及其权限和安全检查
-tests/        本地回归测试（不发布到远端）
-notebook/     本地实验与学习笔记（不发布到远端）
+tests/        本地回归测试
 ```
