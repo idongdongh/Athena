@@ -1,9 +1,10 @@
 # Athena Agent Tracer Evaluation
 
-完整实验结果见 [EXPERIMENT_REPORT.md](EXPERIMENT_REPORT.md)，简历与面试讲法见 [RESUME_AND_INTERVIEW.md](RESUME_AND_INTERVIEW.md)。
+该模块对 Athena 在编码任务中的端到端行为进行可复现评测。它记录模型请求、
+工具调用、Guardrail、上下文压缩和任务结果，再组合确定性 Checks 与
+LLM Rubric 生成轨迹级诊断。
 
-该模块用于评估 Athena 在编码任务中的端到端效果，不用于生成 SFT/RL
-训练数据。
+实验设置、结果与适用边界见 [EXPERIMENT_REPORT.md](EXPERIMENT_REPORT.md)。
 
 ## 评估原则
 

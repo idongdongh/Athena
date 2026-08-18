@@ -1,10 +1,11 @@
-# Athena
+# Athena Eval
 
-Athena 是一个基于 Anthropic Tool Use 的轻量 coding agent，支持流式对话、文件与终端工具、
-上下文压缩、会话持久化、跨会话搜索和项目级长期记忆。
+Athena Eval 是一个可运行的 Coding Agent 与轨迹级评测工程。仓库将 Agent
+执行内核、结构化 Tracing、确定性 Checks、LLM-as-Judge、Failure Onset
+定位和 Wash/Report 流水线放在同一个可复现环境中。
 
-项目目前以本地交互式 CLI 为主，适合学习和验证 Agent 的工具调用、失败恢复、上下文管理
-与记忆机制。
+评测系统不只检查任务是否通过，还会分析工具效率、错误恢复、验证完整性、
+patch 质量以及首个未恢复的错误决策。
 
 ## 功能
 
@@ -27,8 +28,8 @@ Athena 是一个基于 Anthropic Tool Use 的轻量 coding agent，支持流式�
 克隆项目并进入目录：
 
 ```bash
-git clone https://github.com/idongdongh/Athena.git
-cd Athena
+git clone https://github.com/idongdongh/Athena-eval.git
+cd Athena-eval
 ```
 
 创建虚拟环境并安装依赖：
@@ -204,10 +205,11 @@ tools/        模型可调用工具及其权限和安全检查
 tests/        单元测试
 ```
 
-## Agent Tracer Evaluation
+## Trajectory Evaluation
 
 仓库包含独立的 `evaluation/` 评测管线，可在隔离工作区中运行编码任务，
 记录模型请求、工具调用、Guardrail、上下文压缩和任务结果，并生成确定性
 Checks、过程指标、LLM Rubric 与 Failure Onset 诊断。
 
-详细命令与指标口径见 [`evaluation/README.md`](evaluation/README.md)。
+详细命令、输出格式、指标口径和可复现实验见
+[`evaluation/README.md`](evaluation/README.md)。
