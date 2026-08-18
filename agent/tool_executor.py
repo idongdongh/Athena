@@ -31,6 +31,7 @@ from agent.tool_result_classification import (
     ToolOutcome,
     classify_tool_result,
 )
+from agent.trace_events import emit_trace
 from tools._permission import check_tool_permission
 from tools.registry import registry
 
@@ -637,12 +638,32 @@ def execute_tool_calls(
     session_db=None,
     current_session_id: str | None = None,
     show_progress: bool = True,
+    trace_sink=None,
+    trace_context: Mapping[str, Any] | None = None,
 ) -> None:
     """执行一批 tool_use，并按模型原顺序归并结果后写回 messages。"""
 
     calls = [block for block in blocks if getattr(block, "type", None) == "tool_use"]
     if not calls:
         return
+
+    context = dict(trace_context or {})
+    emit_trace(
+        trace_sink,
+        "tool_batch_start",
+        **context,
+        tool_call_count=len(calls),
+        concurrent_requested=concurrent,
+    )
+    for call in calls:
+        emit_trace(
+            trace_sink,
+            "tool_call",
+            **context,
+            tool_call_id=getattr(call, "id", None),
+            tool_name=getattr(call, "name", ""),
+            tool_args=getattr(call, "input", {}),
+        )
 
     if show_progress:
         for call in calls:
@@ -669,5 +690,26 @@ def execute_tool_calls(
         {"type": "tool_result", "tool_use_id": call.id, "content": outcome.content}
         for call, outcome in zip(calls, outcomes)
     ]
+    for call, outcome in zip(calls, outcomes):
+        emit_trace(
+            trace_sink,
+            "tool_result",
+            **context,
+            tool_call_id=getattr(call, "id", None),
+            tool_name=outcome.tool_name,
+            tool_args=getattr(call, "input", {}),
+            status=outcome.status,
+            error_code=outcome.error_code,
+            error_message=outcome.error_message,
+            exit_code=outcome.exit_code,
+            output=outcome.content,
+        )
+    emit_trace(
+        trace_sink,
+        "tool_batch_end",
+        **context,
+        statuses=[outcome.status for outcome in outcomes],
+        parallel=parallel,
+    )
     _enforce_turn_budget(results)
     messages.append({"role": "user", "content": results})

@@ -1,0 +1,49 @@
+tasks:
+  - id: arithmetic-percentage-001
+    source: fixtures/arithmetic_bug
+    prompt: Fix percentage() so all tests pass. Preserve zero-total validation and avoid unrelated changes.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, arithmetic, easy]
+  - id: pagination-boundary-001
+    source: fixtures/pagination_boundary
+    prompt: Fix the pagination behavior so all tests pass. Preserve the existing validation behavior.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, boundary, easy]
+  - id: cart-quantity-001
+    source: fixtures/cart_quantity
+    prompt: Fix the cart subtotal implementation so all tests pass. Avoid changing the public data model.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, multi-file, data-flow, medium]
+  - id: boolean-parser-001
+    source: fixtures/boolean_parser
+    prompt: Implement parse_bool according to its tests. Keep the API strict for unknown values.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, parsing, medium]
+  - id: retry-budget-001
+    source: fixtures/retry_budget
+    prompt: Fix the retry-budget boundary behavior while preserving invalid-counter checks.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, boundary, easy]
+  - id: cache-invalidation-001
+    source: fixtures/cache_invalidation
+    prompt: Fix UserService so updates are observable after a value has already been cached. Keep repository behavior unchanged.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, multi-file, state, medium]
+  - id: inclusive-overlap-001
+    source: fixtures/range_overlap
+    prompt: Fix inclusive date-range overlap behavior so all tests pass. Preserve invalid-range validation.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, boundary, easy]
+  - id: stable-dedup-001
+    source: fixtures/stable_dedup
+    prompt: Fix unique_user_ids so it satisfies its documented ordering contract and all tests pass.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, collection, easy]

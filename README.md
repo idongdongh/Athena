@@ -203,3 +203,11 @@ agent/        对话循环、上下文压缩、工具执行与 guardrail
 tools/        模型可调用工具及其权限和安全检查
 tests/        单元测试
 ```
+
+## Agent Tracer Evaluation
+
+仓库包含独立的 `evaluation/` 评测管线，可在隔离工作区中运行编码任务，
+记录模型请求、工具调用、Guardrail、上下文压缩和任务结果，并生成确定性
+Checks、过程指标、LLM Rubric 与 Failure Onset 诊断。
+
+详细命令与指标口径见 [`evaluation/README.md`](evaluation/README.md)。

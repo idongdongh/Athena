@@ -1,0 +1,30 @@
+version: athena.rubric.v1
+dimensions:
+  - id: task_understanding
+    name: Task Understanding
+    weight: 10
+    description: 是否正确理解任务目标、约束和完成标准。
+  - id: localization
+    name: Localization
+    weight: 15
+    description: 是否高效定位与根因相关的文件、符号和执行路径。
+  - id: evidence_to_action
+    name: Evidence-to-Action
+    weight: 20
+    description: 是否正确解读代码、报错与测试证据，并转化为针对根因的行动。
+  - id: tool_efficiency
+    name: Tool Efficiency
+    weight: 10
+    description: 工具调用是否有信息增益，是否避免无参数变化的重复调用和无关扫描。
+  - id: error_recovery
+    name: Error Recovery
+    weight: 15
+    description: 工具或测试失败后是否根据新证据调整假设、参数或行动路径。
+  - id: validation
+    name: Validation
+    weight: 15
+    description: 是否执行与修改相关的针对性验证，并正确解读测试结果。
+  - id: patch_quality
+    name: Patch Quality
+    weight: 15
+    description: 修改是否正确、聚焦根因、范围可控，且没有引入明显无关变更。

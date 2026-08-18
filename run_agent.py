@@ -46,6 +46,7 @@ class AIAgent:
         working_directory: Path | str | None = None,
         tool_allowlist: frozenset[str] | None = None,
         is_background_review: bool = False,
+        trace_sink: Any = None,
     ) -> None:
         self.model = model
         self.caller_system_prompt = system_prompt
@@ -65,6 +66,8 @@ class AIAgent:
         self.file_mutation_tracker = FileMutationTracker()
         self._tool_allowlist = tool_allowlist
         self._is_background_review = is_background_review
+        self.trace_sink = trace_sink
+        self._trace_turn_counter = 0
         self.interrupt_controller = (
             InterruptController() if is_background_review else interrupt_controller
         )

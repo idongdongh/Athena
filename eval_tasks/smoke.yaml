@@ -1,0 +1,9 @@
+tasks:
+  - id: arithmetic-percentage-001
+    source: fixtures/arithmetic_bug
+    prompt: |
+      Fix the implementation of percentage() so that all tests pass.
+      Keep the zero-total validation and avoid unrelated changes.
+    test_command: [python, -m, unittest, -q]
+    timeout_seconds: 300
+    tags: [python, single-file, bug-fix, easy]

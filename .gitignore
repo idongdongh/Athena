@@ -57,6 +57,8 @@ AGENTS.md
 .athena/
 # 项目级长期记忆包含用户偏好和本地环境信息，不发布到远端
 memories/
+# Agent Evaluation 原始轨迹、测试日志与报告默认只保留在本地
+eval_runs/
 # 旧版本状态目录：保留兼容，避免历史会话丢失
 .hello-agent/
 

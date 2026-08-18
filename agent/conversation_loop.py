@@ -1,6 +1,7 @@
 import signal
 import threading
 import time
+import uuid
 from enum import Enum
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, cast
@@ -24,6 +25,7 @@ from agent.provider_error_recovery import (
 )
 from agent import tool_executor
 from agent.tool_executor import execute_tool_calls, file_mutation_tracker
+from agent.trace_events import emit_trace
 
 if TYPE_CHECKING:
     from run_agent import AIAgent
@@ -482,6 +484,15 @@ def _run_context_compression(
     current_tokens: int,
 ) -> bool:
     """执行一次压缩并显示结果；返回是否真正替换了历史。"""
+    trace_context = getattr(agent, "_active_trace_context", {})
+    emit_trace(
+        getattr(agent, "trace_sink", None),
+        "compression_start",
+        **trace_context,
+        before_messages=len(messages),
+        current_tokens=current_tokens,
+        in_place=agent.context_settings.compression_in_place,
+    )
     print("\n\033[33m⟳ 正在压缩较早的对话上下文...\033[0m")
     result = compress_context(
         context_compressor,
@@ -499,12 +510,30 @@ def _run_context_compression(
             "\033[33m✓ 上下文压缩完成："
             f"{result.before_messages} → {result.after_messages} 条消息\033[0m"
         )
+        emit_trace(
+            getattr(agent, "trace_sink", None),
+            "compression_end",
+            **trace_context,
+            changed=True,
+            before_messages=result.before_messages,
+            after_messages=result.after_messages,
+            error=None,
+        )
         return True
     if result.error:
         print(
             "\033[33m⚠️  上下文压缩失败，原历史未修改："
             f"{result.error}\033[0m"
         )
+    emit_trace(
+        getattr(agent, "trace_sink", None),
+        "compression_end",
+        **trace_context,
+        changed=False,
+        before_messages=result.before_messages,
+        after_messages=result.after_messages,
+        error=result.error,
+    )
     return False
 
 
@@ -557,6 +586,20 @@ def run_conversation(
     turn_interrupt.clear()
     _last_interrupt_time = 0.0
     context_state = agent.context_state
+    trace_sink = getattr(agent, "trace_sink", None)
+    agent._trace_turn_counter = getattr(agent, "_trace_turn_counter", 0) + 1
+    trace_session_id = getattr(agent, "session_id", "test-session")
+    turn_id = f"{trace_session_id}:turn:{agent._trace_turn_counter}"
+    trace_context = {"session_id": trace_session_id, "turn_id": turn_id}
+    agent._active_trace_context = trace_context
+    emit_trace(
+        trace_sink,
+        "turn_start",
+        **trace_context,
+        model=agent.model,
+        message_count=len(messages),
+        user_message=messages[-1].get("content") if messages else None,
+    )
     context_compressor = agent.context_compressor
     if context_compressor is None:
         context_compressor = create_context_compressor(agent)
@@ -589,6 +632,10 @@ def run_conversation(
     request_max_tokens = agent.context_settings.max_output_tokens
     compression_attempts_this_turn = 0
     should_review_memory = agent.begin_memory_review_cycle()
+    terminal_error: dict[str, object] | None = None
+    active_api_request_id: str | None = None
+    active_step_id: int | None = None
+    active_request_started: float | None = None
 
     try:
         while api_call_count < MAX_ITERATIONS and not turn_interrupt.is_requested():
@@ -625,6 +672,24 @@ def run_conversation(
                     break
 
             api_call_count += 1
+            step_id = api_call_count
+            api_request_id = f"api_{uuid.uuid4().hex}"
+            request_started = time.monotonic()
+            active_api_request_id = api_request_id
+            active_step_id = step_id
+            active_request_started = request_started
+            emit_trace(
+                trace_sink,
+                "model_request",
+                **trace_context,
+                step_id=step_id,
+                api_request_id=api_request_id,
+                model=agent.model,
+                message_count=len(messages),
+                tool_count=len(tool_definitions),
+                approx_input_tokens=rough_tokens,
+                max_tokens=request_max_tokens,
+            )
             res, stream_interrupted = _stream_message_with_recovery(
                 client=agent.client,
                 controller=turn_interrupt,
@@ -638,6 +703,16 @@ def run_conversation(
 
             # 处理流式输出时的中断
             if stream_interrupted:
+                emit_trace(
+                    trace_sink,
+                    "model_response",
+                    **trace_context,
+                    step_id=step_id,
+                    api_request_id=api_request_id,
+                    interrupted=True,
+                    duration_ms=round((time.monotonic() - request_started) * 1000),
+                    content=res.content,
+                )
                 # is_placeholder：模型是否已经生成文本（True 表示没有；False 表示生成了）
                 paused_content, is_placeholder = _paused_text_blocks(res.content)
                 messages.append({"role": "assistant", "content": paused_content})
@@ -669,6 +744,28 @@ def run_conversation(
                 agent.record_usage(usage)
             except Exception as exc:
                 print(f"\n\033[33m⚠️  会话 usage 保存失败：{exc}\033[0m")
+            emit_trace(
+                trace_sink,
+                "model_response",
+                **trace_context,
+                step_id=step_id,
+                api_request_id=api_request_id,
+                interrupted=False,
+                duration_ms=round((time.monotonic() - request_started) * 1000),
+                stop_reason=response_state.stop_reason.value,
+                raw_stop_reason=response_state.raw_stop_reason,
+                usage={
+                    "input_tokens": getattr(usage, "input_tokens", 0),
+                    "output_tokens": getattr(usage, "output_tokens", 0),
+                    "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0),
+                    "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0),
+                    "estimated": getattr(usage, "estimated", False),
+                },
+                content=res.content,
+            )
+            active_api_request_id = None
+            active_step_id = None
+            active_request_started = None
 
             # 长度终止必须先于空回复和普通完成处理。截断的工具参数不可信，
             # 因此不写入历史也不执行，只提高输出预算后重试同一个请求。
@@ -803,6 +900,14 @@ def run_conversation(
             if invalid_results is not None:
                 invalid_tool_retries += 1
                 messages.append({"role": "user", "content": invalid_results})
+                emit_trace(
+                    trace_sink,
+                    "invalid_tool_batch",
+                    **trace_context,
+                    step_id=step_id,
+                    retry=invalid_tool_retries,
+                    results=invalid_results,
+                )
                 print(
                     "\033[33m⚠️  模型调用了未知工具，已返回可用工具列表 "
                     f"（{invalid_tool_retries}/3）\033[0m"
@@ -836,12 +941,22 @@ def run_conversation(
                 session_db=getattr(agent, "session_db", None),
                 current_session_id=getattr(agent, "session_id", None),
                 show_progress=not agent._is_background_review,
+                trace_sink=trace_sink,
+                trace_context={**trace_context, "step_id": step_id, "api_request_id": api_request_id},
             )
             prev_step_had_tool_calls = True
 
             halt_decision = agent.tool_guardrails.halt_decision
             # 只允许第一次写入，后面即使工具调用成功，也无法修改
             if halt_decision is not None:
+                emit_trace(
+                    trace_sink,
+                    "guardrail_halt",
+                    **trace_context,
+                    step_id=step_id,
+                    code=halt_decision.code,
+                    message=halt_decision.message,
+                )
                 halt_text = f"工具调用已停止：{halt_decision.message}"
                 print(f"\n\033[33m⚠️  {halt_text}\033[0m")
                 messages.append({
@@ -905,10 +1020,44 @@ def run_conversation(
             print(notice)
 
     except ProviderRequestInterrupted:
+        terminal_error = {"type": "provider_interrupted"}
+        emit_trace(
+            trace_sink,
+            "model_error",
+            **trace_context,
+            step_id=active_step_id,
+            api_request_id=active_api_request_id,
+            error_type="provider_interrupted",
+            duration_ms=(
+                round((time.monotonic() - active_request_started) * 1000)
+                if active_request_started is not None else None
+            ),
+        )
         interrupted_text = "[API 重试已被用户暂停]"
         _emit_assistant_message(messages, interrupted_text, stream_output=stream_output)
     except ProviderRequestFailed as exc:
         error = exc.error
+        terminal_error = {
+            "type": "provider_failed",
+            "kind": error.kind,
+            "status_code": error.status_code,
+            "detail": str(exc.cause)[:500],
+        }
+        emit_trace(
+            trace_sink,
+            "model_error",
+            **trace_context,
+            step_id=active_step_id,
+            api_request_id=active_api_request_id,
+            error_type="provider_failed",
+            kind=error.kind,
+            status_code=error.status_code,
+            detail=str(exc.cause)[:500],
+            duration_ms=(
+                round((time.monotonic() - active_request_started) * 1000)
+                if active_request_started is not None else None
+            ),
+        )
         detail = str(exc.cause).replace("\n", " ")[:500]
         message = f"模型服务请求失败（{error.kind}）"
         if error.status_code is not None:
@@ -925,6 +1074,28 @@ def run_conversation(
             signal.signal(signal.SIGINT, previous_sigint_handler)
         turn_interrupt.clear()
         _last_interrupt_time = 0.0
+        emit_trace(
+            trace_sink,
+            "turn_finish",
+            **trace_context,
+            outcome=outcome.value if outcome is not None else None,
+            api_call_count=api_call_count,
+            message_count=len(messages),
+            terminal_error=terminal_error,
+            unresolved_file_mutations=[
+                {
+                    "tool_name": failure.tool_name,
+                    "path": failure.path,
+                    "error_message": failure.error_message,
+                }
+                for failure in (
+                    agent.file_mutation_tracker.unresolved_failures()
+                    if callable(getattr(agent.file_mutation_tracker, "unresolved_failures", None))
+                    else []
+                )
+            ],
+        )
+        agent._active_trace_context = {}
 
     if outcome is TurnOutcome.COMPLETED and should_review_memory:
         agent.spawn_background_memory_review(messages)
