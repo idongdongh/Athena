@@ -1,11 +1,10 @@
-# Athena Eval
+# Athena
 
-Athena Eval 是一个可运行的 Coding Agent 与轨迹级评测工程。仓库将 Agent
-执行内核、结构化 Tracing、确定性 Checks、LLM-as-Judge、Failure Onset
-定位和 Wash/Report 流水线放在同一个可复现环境中。
+Athena 是一个基于 Anthropic Tool Use 的轻量 Coding Agent，支持流式对话、
+文件与终端工具、上下文压缩、会话持久化、跨会话搜索和项目级长期记忆。
 
-评测系统不只检查任务是否通过，还会分析工具效率、错误恢复、验证完整性、
-patch 质量以及首个未恢复的错误决策。
+除交互式 CLI 和 Agent Harness 外，仓库还包含轨迹级评测模块，用于分析
+工具效率、错误恢复、验证完整性、patch 质量和 Failure Onset。
 
 ## 功能
 
@@ -16,6 +15,7 @@ patch 质量以及首个未恢复的错误决策。
 - 达到上下文阈值时压缩早期消息，同时保留近期任务和工具调用配对。
 - 使用 SQLite 持久化会话，并通过 FTS5 搜索历史消息。
 - 使用项目内 Markdown 文件保存长期记忆，并在后台定期复盘对话。
+- 记录模型、工具、Guardrail 和压缩事件，生成规则指标与 LLM Rubric 诊断。
 
 ## 环境要求
 
