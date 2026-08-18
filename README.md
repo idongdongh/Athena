@@ -28,8 +28,8 @@ Athena 是一个基于 Anthropic Tool Use 的轻量 Coding Agent，支持流式�
 克隆项目并进入目录：
 
 ```bash
-git clone https://github.com/idongdongh/Athena-eval.git
-cd Athena-eval
+git clone https://github.com/idongdongh/Athena.git
+cd Athena
 ```
 
 创建虚拟环境并安装依赖：
