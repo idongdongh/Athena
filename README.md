@@ -6,6 +6,12 @@ Athena 是一个基于 Anthropic Tool Use 的轻量 Coding Agent，支持流式�
 除交互式 CLI 和 Agent Harness 外，仓库还包含轨迹级评测模块，用于分析
 工具效率、错误恢复、验证完整性、patch 质量和 Failure Onset。
 
+## Demo
+
+Athena 定位缺陷、生成最小补丁，并在 Docker 沙箱中运行对应测试完成验证：
+
+![Athena terminal demo](docs/assets/athena-demo.gif)
+
 ## 功能
 
 - 使用 `bash`、`read_file`、`write_file`、`patch`、`search_files`、`web_search` 和
@@ -22,6 +28,7 @@ Athena 是一个基于 Anthropic Tool Use 的轻量 Coding Agent，支持流式�
 - Python 3.12 或更高版本
 - [uv](https://docs.astral.sh/uv/)
 - Anthropic API key，或兼容 Anthropic Messages API 的服务
+- 可选：Docker Desktop、Docker Engine 或 Podman（仅启用本地命令沙箱时需要）
 
 ## 快速启动
 
@@ -92,6 +99,20 @@ memory:
   nudge_interval: 10
   directory: memories
 
+terminal:
+  # local 保持原有宿主执行；docker 使用本机 Docker/Podman 沙箱
+  backend: local
+  timeout: 120
+  docker:
+    runtime: auto
+    image: python:3.11-slim
+    network: false
+    cpu: 1.0
+    memory_mb: 1024
+    pids_limit: 128
+    workspace_read_only: false
+    startup_timeout: 120
+
 tool_loop_guardrails:
   warnings_enabled: true
   hard_stop_enabled: true
@@ -106,6 +127,22 @@ tool_loop_guardrails:
 ```
 
 配置文件或字段缺失时使用代码默认值。修改配置后需要重启 Athena。
+
+### 本地命令沙箱
+
+将 `terminal.backend` 改成 `docker` 后，`bash` 命令会在本机 Docker 或 Podman 容器中
+执行。Athena 在首次命令调用时惰性创建容器，并在 CLI 退出时删除容器；Docker 不可用或
+启动失败时会明确报错，不会回退到宿主机。
+
+沙箱默认关闭网络、移除 Linux capabilities、禁止提权，并限制 CPU、内存和 PID 数量。
+工作区挂载到容器内相同的绝对路径，因此 `bash` 和 `read_file`、`write_file`、`patch`
+看到同一批文件；在 POSIX 主机上容器进程使用宿主 UID/GID，避免创建 root 所有的项目文件。
+镜像必须提供 `bash`、`setsid` 和 `sleep`。
+
+需要注意：工作区默认以读写方式挂载，所以容器内命令仍能修改或删除项目文件，也能读取
+工作区中的 `.env`。容器隔离不能替代危险命令审批，也不是工作区秘密隔离。需要运行
+只读审计时可设置 `workspace_read_only: true`；需要联网安装依赖时再显式设置
+`network: true`。
 
 ## 交互命令
 
@@ -122,7 +159,8 @@ tool_loop_guardrails:
 ## 中断行为
 
 模型回复会流式显示。任务运行期间第一次按 `Ctrl+C` 会请求暂停：关闭当前模型流、终止
-正在运行的 bash 进程组，并保留模型已经输出的文本；2 秒内再次按下会退出程序。
+正在运行的 bash 进程组（Docker 后端会同时终止容器内进程），并保留模型已经输出的文本；
+2 秒内再次按下会退出程序。
 
 REPL 空闲时：
 
@@ -202,6 +240,7 @@ session_db.py SQLite 会话存储、压缩链和全文搜索
 athena_cli/   CLI 配置、斜杠命令、会话列表和 Agent 初始化
 agent/        对话循环、上下文压缩、工具执行与 guardrail
 tools/        模型可调用工具及其权限和安全检查
+tools/environments/  Local 与 Docker/Podman 命令执行后端
 tests/        单元测试
 ```
 
