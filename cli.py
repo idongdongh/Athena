@@ -18,8 +18,9 @@ from agent.tool_guardrails import ToolCallGuardrailConfig
 from athena_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from athena_cli.cli_commands_mixin import CLICommandsMixin
 from athena_cli.commands import command_names, resolve_command
-from athena_cli.config import MemorySettings, SessionSettings, load_config
+from athena_cli.config import MemorySettings, SessionSettings, TerminalSettings, load_config
 from session_db import SessionDB
+from tools.command_environment import close_command_environment, configure_command_environment
 
 
 def _handle_idle_ctrl_c(event) -> None:
@@ -60,6 +61,8 @@ class AthenaCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.context_settings = ContextSettings.from_mapping(config)
         self.session_settings = SessionSettings.from_mapping(config)
         self.memory_settings = MemorySettings.from_mapping(config)
+        self.terminal_settings = TerminalSettings.from_mapping(config)
+        configure_command_environment(self.terminal_settings, Path.cwd())
         # 支持的所有命令名称（元组）
         self.command_names = command_names()
         self.conversation_history: list[dict] = []
@@ -143,8 +146,11 @@ class AthenaCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self.agent.end("user_exit")
             # 关闭数据库连接
             finally:
-                if self._session_db is not None:
-                    self._session_db.close()
+                try:
+                    close_command_environment()
+                finally:
+                    if self._session_db is not None:
+                        self._session_db.close()
 
 
 def main() -> None:
